@@ -1,0 +1,80 @@
+{#
+  Purpose:    Pre-summarisation pass. Converts raw BRD + supporting documents + discussion
+              notes into a structured requirements dict BEFORE any other generation call.
+              This dict — not the raw text — is passed to every subsequent LLM call.
+  Variables:
+    - combined_text (str): BRD + supporting docs + discussion notes, concatenated with
+      '=== DOCUMENT: filename ===' / '=== CLIENT DISCUSSION NOTES ===' markers
+    - technology (str): selected SAP technology (display name), or the literal string
+      "auto" when the user asked the agent to recommend the technology instead
+    - technology_options (list[str]): the full list of supported SAP technology names —
+      only used when technology == "auto", to constrain the recommendation to a valid choice
+  Output:     A single JSON object with exactly these keys:
+              requirements (list[str]), kpis (list[str]), data_sources (list[str]),
+              domain (list[str], values restricted to: finance, sales, procurement,
+              operations, hr), key_entities (list[str]), open_gaps (list[str]),
+              recommended_technologies (list[str]) — populated ONLY when technology == "auto"
+#}
+{% if technology == "auto" %}
+You are performing a pre-summarisation pass on client input, before any specification document is generated. The target SAP technology has not been selected yet — as part of this pass, you must also recommend the most suitable technology/technologies.
+{% else %}
+You are performing a pre-summarisation pass on client input for a {{ technology }} implementation, before any specification document is generated.
+{% endif %}
+
+## Input Content
+
+{{ combined_text }}
+
+## Your Task
+
+Read all of the input above (BRD, any supporting documents, and any discussion notes) and extract a structured summary. Do not generate a specification document — only extract and structure what is stated or clearly implied.
+
+Populate these fields:
+- **requirements**: every discrete, distinct requirement stated or clearly implied in the input, written as short standalone statements
+- **kpis**: every KPI, metric, or measure mentioned or implied (e.g. "EBITDA", "DSO", "Revenue by region")
+- **data_sources**: every source system, data object, or integration point identified (e.g. "S/4HANA", "Salesforce", "Excel uploads")
+- **domain**: the primary functional domain(s) this content belongs to. Choose ONLY from this fixed list, and include every domain that materially applies: "finance", "sales", "procurement", "operations", "hr". Return an empty list if none can be determined.
+- **key_entities**: business entities in scope (legal entities, cost centres, products, business units, etc.)
+- **open_gaps**: items that appear incomplete, ambiguous, or contradictory in the input — these will drive clarification questions later
+{% if technology == "auto" %}
+- **recommended_technologies**: the SAP technology or technologies best suited to deliver these requirements, based on the KPIs, data sources, and requirements identified above. Choose ONLY from this fixed list of supported technologies, using the exact spelling shown:
+{% for option in technology_options %}
+  - "{{ option }}"
+{% endfor %}
+  Recommend more than one technology only when the requirements genuinely span multiple distinct platforms (e.g. reporting AND planning). Prefer a single best-fit recommendation where possible.
+{% endif %}
+
+## Rules
+- Do not invent requirements, KPIs, or entities that are not stated or reasonably implied by the input
+- Keep each list item concise (one sentence or a short phrase)
+- If a category has no applicable items, return an empty list for it — never omit the key
+{% if technology == "auto" %}
+- `recommended_technologies` must contain at least one entry, drawn only from the supported technology list above
+{% endif %}
+
+## Output Format
+
+Return compact JSON only — no pretty printing, no indentation, no newlines within string values. All text values must be plain strings under 200 characters each. Do not include explanatory text before or after the JSON object.
+
+Return ONLY a valid JSON object. No preamble, no explanation, no markdown code fences.
+
+{% if technology == "auto" %}
+{
+  "requirements": ["..."],
+  "kpis": ["..."],
+  "data_sources": ["..."],
+  "domain": ["finance"],
+  "key_entities": ["..."],
+  "open_gaps": ["..."],
+  "recommended_technologies": ["..."]
+}
+{% else %}
+{
+  "requirements": ["..."],
+  "kpis": ["..."],
+  "data_sources": ["..."],
+  "domain": ["finance"],
+  "key_entities": ["..."],
+  "open_gaps": ["..."]
+}
+{% endif %}

@@ -1,0 +1,78 @@
+{#
+  Purpose:    Generate ONE batch (3–4 sections) of the Technical Specification Document (TSD).
+              Produces structured text with section markers parsed by document_builder.py.
+              Called once per batch — never for the whole document in one call (CLAUDE.md §3.7).
+  Variables:
+    - fsd_full_text (str): the FULL parsed FSD document text — not a summary (FR-14/§9.5)
+    - technology (str): selected SAP technology
+    - structured_summary (dict): keys: requirements, kpis, data_sources, domain, key_entities, open_gaps
+    - clarification_answers (dict): {question_id: answer_text} — may be empty
+    - metadata (dict): consultant, client, project, engagement_code
+    - all_section_titles (list[str]): "N. Title" for every section in the document, for context
+    - batch_sections (list[dict]): the subset of sections to generate in this call —
+      each item has: number, title, description, format
+    - section_instructions (dict): {section_number: detailed writing instructions}
+  Output:     Structured text with ## SECTION_N: markers, one per section in batch_sections.
+#}
+You are generating {{ batch_sections|length }} section(s): {% for section in batch_sections %}{{ section.number }}. {{ section.title }}{% if not loop.last %}, {% endif %}{% endfor %}.
+Be thorough but concise. For tables: include all required columns but limit rows to the most important items — do not pad with generic filler rows.
+For prose: maximum 4 sentences per paragraph.
+Do not add section headings for sections not requested.
+Do not add preamble or closing remarks outside the section content itself.
+
+You are generating part of a Technical Specification Document (TSD) for a {{ technology }} implementation. A developer reading the full TSD must have everything needed to build the solution without further briefing. This call covers ONLY the sections listed below — do not generate any other section.
+
+## Full Functional Specification Document (primary input — not a summary)
+
+{{ fsd_full_text }}
+
+## Structured Requirements Summary (for traceability)
+
+**KPIs / Metrics:**
+{% for kpi in structured_summary.kpis %}
+- {{ kpi }}
+{% endfor %}
+
+**Data Sources:**
+{% for src in structured_summary.data_sources %}
+- {{ src }}
+{% endfor %}
+
+## Document Metadata
+
+Author: {{ metadata.consultant }} | Client: {{ metadata.client }} | Project: {{ metadata.project }}{% if metadata.engagement_code %} | Engagement Code: {{ metadata.engagement_code }}{% endif %}
+
+{% if clarification_answers %}
+## Clarification Answers Provided by the User
+
+{% for qid, answer in clarification_answers.items() %}
+{% if answer %}
+Question {{ qid }}: {{ answer }}
+{% endif %}
+{% endfor %}
+{% else %}
+## Note
+No clarification answers were provided. Document all technical assumptions in the Technical Assumptions and Constraints section.
+{% endif %}
+
+## Full Document Outline (for context only — generate ONLY the sections listed below)
+
+{% for title in all_section_titles %}
+- {{ title }}
+{% endfor %}
+
+## Sections to Generate in This Call
+
+{% for section in batch_sections %}
+### Section {{ section.number }}: {{ section.title }}
+{{ section_instructions.get(section.number, section.description) }}
+
+{% endfor %}
+
+## Generation Rules
+
+- Start each section with the EXACT marker `## SECTION_{{ "N" }}:` where N is the section number. Section content follows immediately.
+- Write from the perspective of a senior SAP Technical Consultant / Technical Architect — every FSD requirement covered in this batch must be translated to a concrete technical design
+- Every section must use at least one of: structured prose, a table, or a bulleted list — no unstructured walls of text
+- ABAP or code samples, if any, belong only in clearly labelled code blocks — never inline in prose
+- Where the FSD is silent and no clarification was given, record a technical assumption — never invent a requirement

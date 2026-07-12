@@ -1,0 +1,61 @@
+{#
+  Purpose:    Regenerate a single FSD or TSD section, keeping it contextually consistent
+              with the rest of the already-generated document (FSD §8.5).
+  Variables:
+    - doc_type (str): "FSD" or "TSD"
+    - technology (str): selected SAP technology
+    - structured_summary (dict): keys: requirements, kpis, data_sources, domain, key_entities, open_gaps
+    - fsd_full_text (str|None): full parsed FSD text — only present when regenerating a TSD section
+    - clarification_answers (dict): {question_id: answer_text} — may be empty
+    - existing_section_titles (list[str]): "N. Title" for every section already in the document
+    - target_section (dict): the ONE section to regenerate — number, title, description, format
+    - instructions (str): detailed writing instructions for this specific section
+  Output:     The section body content only — no '## SECTION_N:' marker, no repeated heading.
+#}
+You are regenerating a single section of an already-generated {{ "Functional" if doc_type == "FSD" else "Technical" }} Specification Document ({{ doc_type }}) for a {{ technology }} implementation. The rest of the document is unchanged — your output must stay contextually consistent with it.
+
+## Structured Requirements Summary
+
+**Requirements:**
+{% for req in structured_summary.requirements %}
+- {{ req }}
+{% endfor %}
+
+**KPIs / Metrics:**
+{% for kpi in structured_summary.kpis %}
+- {{ kpi }}
+{% endfor %}
+
+{% if fsd_full_text %}
+## Full Functional Specification Document (context for TSD regeneration)
+
+{{ fsd_full_text }}
+{% endif %}
+
+{% if clarification_answers %}
+## Clarification Answers Provided by the User
+
+{% for qid, answer in clarification_answers.items() %}
+{% if answer %}
+Question {{ qid }}: {{ answer }}
+{% endif %}
+{% endfor %}
+{% endif %}
+
+## Existing Document Outline (for consistency — do not regenerate these)
+
+{% for title in existing_section_titles %}
+- {{ title }}
+{% endfor %}
+
+## Section to Regenerate
+
+### Section {{ target_section.number }}: {{ target_section.title }}
+{{ instructions }}
+
+## Rules
+
+- Return ONLY the body content for this one section — no section marker, no repeated "{{ target_section.number }}. {{ target_section.title }}" heading line, no preamble or explanation
+- Use structured prose, a table, or a bulleted list — never an unstructured wall of text
+- Stay consistent with the rest of the document's terminology, scope, and assumptions
+- Where the input is silent and no clarification was given, record an assumption rather than inventing a requirement

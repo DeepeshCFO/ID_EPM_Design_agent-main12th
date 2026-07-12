@@ -1,0 +1,83 @@
+{#
+  Purpose:    Generate clarification questions from the pre-summarised BRD content.
+              Runs AFTER pre-summarisation — receives the structured_summary dict, never
+              the raw BRD text (FR-07 token optimisation).
+  Variables:
+    - structured_summary (dict): keys: requirements, kpis, data_sources, domain,
+      key_entities, open_gaps
+    - technology (str): selected SAP technology (display name)
+    - sap_skill (dict): keys: summary, key_concepts, kpis, sap_objects, common_patterns
+    - domain_skills (list[dict]): domain knowledge dicts for the detected domain(s)
+  Output:     JSON array of up to 10 question objects:
+              [{"id": 1, "question": "...", "category": "...", "impact": "..."}]
+              category values: Data Sources | Scope | Planning | Reporting | Integration | Authorisation | Technical
+#}
+You are analysing the pre-summarised requirements for a {{ technology }} implementation.
+
+## Requirements Identified
+
+{% for req in structured_summary.requirements %}
+- {{ req }}
+{% endfor %}
+
+## KPIs / Metrics Identified
+
+{% for kpi in structured_summary.kpis %}
+- {{ kpi }}
+{% endfor %}
+
+## Data Sources Identified
+
+{% for src in structured_summary.data_sources %}
+- {{ src }}
+{% endfor %}
+
+## Key Entities in Scope
+
+{% for entity in structured_summary.key_entities %}
+- {{ entity }}
+{% endfor %}
+
+## Open Gaps Identified During Pre-Summarisation
+
+{% if structured_summary.open_gaps %}
+{% for gap in structured_summary.open_gaps %}
+- {{ gap }}
+{% endfor %}
+{% else %}
+No open gaps were identified.
+{% endif %}
+
+## Your Task
+
+Generate up to 10 targeted clarification questions, prioritising the open gaps above. Rules for questions:
+- Each question must be specific, concise, and consultant-grade
+- Only ask questions where the answer would materially change the solution design
+- Do not ask questions that are already answered by the requirements, KPIs, data sources, or entities listed above
+- Do not ask vague questions like "Can you tell me more about the requirements?"
+- Prioritise questions about: data sources, system versions, scope boundaries, planning horizons, and authorisation model
+- If the identified gaps are minor or the input is otherwise complete, return fewer questions (even zero is acceptable)
+
+Question categories to consider:
+- **Data Sources**: source system version, extraction method, historical data scope
+- **Scope**: number of entities/legal entities/cost centres/products in scope
+- **Planning**: planning cycle, horizon, driver assumptions, version management
+- **Reporting**: mandatory vs optional reports, refresh frequency, distribution method
+- **Integration**: real-time vs batch, API availability, interface owners
+- **Authorisation**: who sees what data, row-level security requirements, role mapping
+- **Technical**: SAP system version, landscape (dev/QA/prod), go-live constraints
+
+## Output Format
+
+Return ONLY a valid JSON array. No preamble, no explanation, no markdown code fences.
+
+[
+  {
+    "id": 1,
+    "question": "The exact question text, written as a consultant would ask a client",
+    "category": "Data Sources",
+    "impact": "One sentence explaining what solution design element this answer affects"
+  }
+]
+
+If no questions are needed, return an empty array: []
