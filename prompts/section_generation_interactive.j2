@@ -1,0 +1,132 @@
+{#
+  Purpose:    Generate EXACTLY ONE section of an FSD or TSD as part of the interactive
+              generate -> review -> refine -> lock loop (CLAUDE.md §3.7/§3.8a, FSD FR-09/FR-10).
+              Used for both the first draft of a section and every feedback-driven
+              regeneration of that same section — never for more than one section per call.
+  Variables:
+    - doc_type (str): "FSD" or "TSD"
+    - structured_summary (dict): requirements, kpis, data_sources, domain, key_entities, open_gaps
+    - technology (str): selected SAP technology
+    - clarification_answers (dict): {question_id: answer_text} — may be empty
+    - metadata (dict): consultant, client, project, engagement_code
+    - all_section_titles (list[str]): "N. Title" for every section in the document, for context
+    - locked_sections (list[dict]): every previously locked section — number, title, content,
+      question, answer — in section order
+    - target_section (dict): the ONE section to generate now — number, title, description, format
+    - instructions (str): detailed writing instructions for this section
+    - fsd_full_text (str|None): full parsed FSD text — only present for TSD generation
+    - feedback (dict|None): {previous_content, feedback_text} — present only when regenerating
+      this section after a user correction
+  Output:     "## SECTION_CONTENT:" followed by the section body, then "## SECTION_QUESTION:"
+              followed by exactly one targeted question about this section, or the literal
+              word NONE if there is nothing to ask.
+#}
+You are generating EXACTLY ONE section — Section {{ target_section.number }}: {{ target_section.title }} —
+of a {{ "Functional" if doc_type == "FSD" else "Technical" }} Specification Document ({{ doc_type }})
+for a {{ technology }} implementation. Do not generate any other section, and do not repeat the
+content of any previously locked section.
+
+## Structured Requirements Summary
+
+**Requirements:**
+{% for req in structured_summary.requirements %}
+- {{ req }}
+{% endfor %}
+
+**KPIs / Metrics:**
+{% for kpi in structured_summary.kpis %}
+- {{ kpi }}
+{% endfor %}
+
+**Data Sources:**
+{% for src in structured_summary.data_sources %}
+- {{ src }}
+{% endfor %}
+
+**Key Entities:**
+{% for entity in structured_summary.key_entities %}
+- {{ entity }}
+{% endfor %}
+
+**Open Gaps:**
+{% if structured_summary.open_gaps %}
+{% for gap in structured_summary.open_gaps %}
+- {{ gap }}
+{% endfor %}
+{% else %}
+None identified.
+{% endif %}
+
+{% if fsd_full_text %}
+## Full Functional Specification Document (primary input for TSD generation)
+
+{{ fsd_full_text }}
+{% endif %}
+
+## Document Metadata
+
+Author: {{ metadata.consultant }} | Client: {{ metadata.client }} | Project: {{ metadata.project }}{% if metadata.engagement_code %} | Engagement Code: {{ metadata.engagement_code }}{% endif %}
+
+{% if clarification_answers %}
+## Clarification Answers Provided by the User
+
+{% for qid, answer in clarification_answers.items() %}
+{% if answer %}
+Question {{ qid }}: {{ answer }}
+{% endif %}
+{% endfor %}
+{% endif %}
+
+## Full Document Outline (for context only)
+
+{% for title in all_section_titles %}
+- {{ title }}
+{% endfor %}
+
+{% if locked_sections %}
+## Previously Locked Sections (final content — use as context, never regenerate these)
+
+{% for locked in locked_sections %}
+### Section {{ locked.number }}: {{ locked.title }} (locked)
+{{ locked.content }}
+{% if locked.question %}
+Targeted question asked: {{ locked.question }}
+User's answer/correction: {{ locked.answer or "(approved as-is)" }}
+{% endif %}
+
+{% endfor %}
+{% else %}
+No sections have been locked yet — this is the first section of the document.
+{% endif %}
+
+{% if feedback %}
+## User Feedback on the Previous Draft of This Section
+
+Previous draft:
+{{ feedback.previous_content }}
+
+User correction: {{ feedback.feedback_text }}
+
+Regenerate Section {{ target_section.number }} incorporating this feedback.
+{% endif %}
+
+## Section to Generate Now
+
+### Section {{ target_section.number }}: {{ target_section.title }}
+{{ instructions }}
+
+## Generation Rules
+
+- Write from the perspective of a senior SAP {{ "Functional" if doc_type == "FSD" else "Technical" }} Consultant.
+- Use structured prose, a table, or a bulleted list — never an unstructured wall of text. Prose paragraphs must not exceed 4–6 sentences.
+- Where the input is silent and no clarification was given, record an assumption rather than inventing a requirement.
+- You may ask AT MOST ONE targeted, section-specific question — something answerable by looking at the draft you just wrote (e.g. "should currency translation use a fixed monthly rate or a real-time feed?"). Never a generic discovery question. If nothing about this section is genuinely ambiguous, ask no question.
+
+## Required Output Format
+
+Respond with EXACTLY this structure and nothing else:
+
+## SECTION_CONTENT:
+<the full section body — no repeated "{{ target_section.number }}. {{ target_section.title }}" heading line>
+## SECTION_QUESTION:
+<your one targeted question, or the literal word NONE if you have none>

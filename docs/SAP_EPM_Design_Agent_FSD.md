@@ -1,6 +1,6 @@
 # SAP EPM Design Agent — Functional Specification Document
-**Version:** 2.0 (Updated)
-**Date:** July 2025
+**Version:** 2.1 (Updated)
+**Date:** July 2026
 **Prepared By:** Deepesh Khanna, Capgemini I&D – SAP Portfolio
 **Audience:** Solution Architects, Functional Consultants, AI/Dev Team Leads
 **Classification:** Internal – Confidential
@@ -14,6 +14,7 @@
 |---|---|---|---|
 | 1.0 | June 2025 | Deepesh Khanna | Initial draft |
 | 2.0 | July 2025 | Deepesh Khanna | Added multi-document input, discussion notes, two-phase FSD→TSD workflow, project metadata, section-level regeneration, BRD pre-summarisation, domain auto-detection, Word document quality standards |
+| 2.1 | July 2026 | Deepesh Khanna | Replaced one-shot clarification Q&A + batched blind generation with an interactive, section-by-section generate → review → refine → lock loop for both FSD and TSD |
 
 ---
 
@@ -77,6 +78,9 @@ version 2.0. It describes what the system must do — not how it is technically 
 - Support for user-supplied FSD/TSD blank Word templates (optional)
 - Section-level regeneration: ability to regenerate a single FSD or TSD section
 - Download of both generated documents from the Streamlit UI
+- Interactive, per-section generation with an inline confirm/correct loop before each
+  section is locked — replaces the prior model of answering all clarification questions
+  up front, then generating the full document blind
 
 ### 2.3 Out of Scope
 - Multi-technology output from a single BRD session
@@ -190,28 +194,59 @@ version 2.0. It describes what the system must do — not how it is technically 
 - Only relevant domain skills are loaded and injected into subsequent prompts
 - If domain cannot be determined, all domain skills are loaded as fallback
 
-### 4.3 Clarification Questions
+### 4.3 Section-Level Interactive Review
 
-#### FR-09 Clarification Question Generation
-- After pre-summarisation, the agent generates up to 10 targeted clarification questions
-  based on gaps identified in `open_gaps` of the structured summary
-- Questions are displayed inline before any document generation
-- Each question has a free-text answer field — all optional
-- "Skip All & Generate FSD" button bypasses the question step entirely
-- Skipped questions are documented in the FSD Assumptions Register
-- The agent must not halt if all questions are skipped
+#### FR-09 Per-Section Targeted Question
+- Clarification is no longer a single up-front batch of questions. Instead, while
+  generating a given section, the agent may surface **at most one** open question
+  specific to that section's content — never a batch of questions, never asked before
+  any content exists
+- The question must be answerable by looking at the draft just shown (e.g. "should
+  currency translation use a fixed monthly rate or a real-time feed?"), not a generic
+  discovery question
+- If the agent has no open question for a section (draft is unambiguous given the
+  input), no question is shown — the user only confirms or corrects the content
+- This is distinct from the deeper BRD-level grilling mechanism used elsewhere in the
+  Presales Agent; it is a lighter, single-question confirmation scoped to one section
+- Items left unresolved after the maximum regeneration attempts (FR-10) are documented
+  in the FSD Assumptions Register or Open Questions Register as appropriate
 
 ### 4.4 Phase 1 — FSD Generation
 
-#### FR-10 FSD Generation
-- FSD is generated using the structured BRD summary dict + clarification answers +
-  relevant SAP skill + relevant domain skills
-- FSD is generated **section by section in batches of 3–4 sections per API call**
-  to allow deeper content per section and avoid output token limits
-- Each batch call receives: the structured summary, technology context, and the
-  section numbers + descriptions to generate in that batch
-- Section content is assembled in order after all batches complete
-- A progress indicator shows which batch/section group is being generated
+#### FR-10 Section Generation and Review Loop
+- Sections are generated **one at a time**, in the order defined by the active section
+  structure (uploaded template if provided, otherwise the 14-section default)
+- For each section, the system shall:
+  1. Generate a draft of that section only, using: the structured BRD summary, relevant
+     SAP/domain skills, clarification answers, **plus the locked content and answers of
+     every previously approved section**
+  2. Display the generated draft in the right-hand panel, with any open question (FR-09)
+  3. Present a single free-text input: "Does this look right?" — blank means approved as-is
+  4. If the user enters a correction, regenerate the same section incorporating that
+     feedback, and return to step 2 (the loop does not advance until the user is
+     satisfied)
+  5. Once approved (blank response, or an explicit "looks good"), lock the section:
+     store its final content and any Q&A exchange, mark it complete in the section
+     tracker, and move to the next section
+- **Maximum regeneration attempts per section: 5.** If exceeded, the section is
+  force-locked using the latest draft, and a note is added to the Open Questions
+  Register (Section 4.4, FR-11 sections table item 12) flagging it as "locked after
+  maximum revisions — recommend manual review"
+- The left-hand step navigator shows every section's status at all times: locked (with
+  revision count), current, or pending
+- Once the final section is locked, the document is assembled and the download button
+  is shown — same as today
+
+#### FR-10a Generation Mode — Architecture Note
+- Because each section's generation depends on the previous section's *locked* content
+  and answers, this loop requires **exactly one section generated per API call**
+- This supersedes the previous multi-section batching approach (grouping sections into
+  one call for efficiency) — that approach is incompatible with sequential
+  context carry-forward and is retained in the codebase only as an optional legacy
+  fallback (see CLAUDE.md §3.7), never active at the same time as the interactive loop
+- This trades away some token/latency efficiency in exchange for per-section user
+  confidence: expect up to 14+ LLM calls per FSD (more with revisions), versus roughly
+  5 batched calls previously
 
 #### FR-11 FSD Mandatory Sections
 The FSD shall be written from the perspective of a senior SAP Functional Consultant.
@@ -263,8 +298,14 @@ It shall not contain raw code, technical configurations, or developer-level deta
 #### FR-15 TSD Generation
 - TSD is generated using: full FSD text + structured BRD summary + clarification answers
   + SAP skill + domain skills
-- TSD is also generated **section by section in batches of 3–4 sections per API call**
-- A progress indicator shows which section group is being generated
+- TSD follows the same interactive, section-by-section generate → review → refine →
+  lock loop described in FR-10, generating **exactly one section per API call**, with
+  each new section's prompt including the full FSD text plus every previously locked
+  TSD section's content and answers
+- The same per-section targeted question model (FR-09) and 5-attempt regeneration cap
+  (FR-10) apply
+- The left-hand step navigator shows TSD section status (locked / current / pending)
+  the same way it does for FSD generation
 
 #### FR-16 TSD Mandatory Sections
 The TSD shall be written for an SAP Technical Consultant or Developer.
@@ -396,25 +437,26 @@ The TSD shall be written for an SAP Technical Consultant or Developer.
 | 5 | (Optional) Enters project metadata: consultant, client, project, engagement code | Values stored; shown as a summary card |
 | 6 | Selects target SAP technology from dropdown | Technology description shown as info box |
 | 7 | (Optional) Uploads FSD template .docx | Template confirmed; structure will be used as FSD skeleton |
-| 8 | Clicks 'Analyse Input' | Spinner: "Pre-summarising all input documents…" → structured summary created; domain(s) auto-detected |
-| 9 | Reviews clarification questions inline; answers any or skips all | Free-text answers per question; "Skip All & Generate FSD" button available |
-| 10 | Clicks 'Generate FSD' | Progress indicator: "Generating FSD — Sections 1–3 of 14…" → "Sections 4–6…" etc. |
-| 11 | FSD generation completes | Success message; "Download FSD (.docx)" button displayed; section list shown |
-| 12 | (Optional) Selects a section from dropdown and clicks 'Regenerate Section' | Only that section is regenerated; document rebuilt; re-download available |
-| 13 | Downloads FSD | Browser file download triggered |
+| 8 | Clicks 'Analyse Input' | Spinner: "Pre-summarising all input documents…" → structured summary created; domain(s) auto-detected; section plan built from template or 14-section default |
+| 9 | Agent begins generating Section 1 | Right panel shows Section 1 draft + any targeted question; left panel shows Section 1 as "current," all others "pending" |
+| 9a | User answers the question and/or types a correction, or leaves it blank | If correction given: section regenerates and re-displays (loop repeats, up to 5 attempts). If blank/approved: section locks, left panel updates to "locked," next section generation begins automatically |
+| 9b–9n | Repeat 9a for each remaining section | Progress accumulates in the left panel; each new section's generation uses all previously locked sections' content and answers as context |
+| 10 | Final section locked | Document assembled automatically; "Download FSD (.docx)" button displayed |
+| 11 | (Optional) Selects a locked section from dropdown and clicks 'Regenerate Section' | Only that section is regenerated outside the main loop; document rebuilt; re-download available |
+| 12 | Downloads FSD | Browser file download triggered |
 
 ### Phase 2 — TSD Generation
 
 | Step | User Action | System Response |
 |---|---|---|
-| 14 | Clicks 'Proceed to TSD Generation' | Phase 2 panel expands; two FSD input options shown |
-| 15 | Option A: Clicks 'Use Session FSD' OR Option B: Uploads revised FSD .docx | Chosen FSD parsed; word count and filename displayed for confirmation |
-| 16 | (Optional) Uploads TSD template .docx | Template confirmed |
-| 17 | Clicks 'Generate TSD' | Progress indicator: "Generating TSD — Sections 1–3 of 14…" → etc. |
-| 18 | TSD generation completes | Success message; "Download TSD (.docx)" button displayed |
-| 19 | (Optional) Selects a section and clicks 'Regenerate Section' | Only that section regenerated; re-download available |
-| 20 | Downloads TSD | Browser file download triggered |
-| 21 | (Optional) Clicks 'Start Over' | All session state cleared; returns to Step 1 |
+| 13 | Clicks 'Proceed to TSD Generation' | Phase 2 panel expands; two FSD input options shown |
+| 14 | Option A: Clicks 'Use Session FSD' OR Option B: Uploads revised FSD .docx | Chosen FSD parsed; word count and filename displayed for confirmation |
+| 15 | (Optional) Uploads TSD template .docx | Template confirmed |
+| 16 | Agent begins generating TSD Section 1 | Same interactive loop as Phase 1 (Steps 9–9n): draft + question shown, user confirms/corrects, section locks, next section begins |
+| 17 | Final TSD section locked | Document assembled automatically; "Download TSD (.docx)" button displayed |
+| 18 | (Optional) Selects a locked section and clicks 'Regenerate Section' | Only that section regenerated outside the main loop; re-download available |
+| 19 | Downloads TSD | Browser file download triggered |
+| 20 | (Optional) Clicks 'Start Over' | All session state cleared; returns to Step 1 |
 
 ---
 
@@ -559,6 +601,8 @@ The pre-summarisation step is a dedicated LLM call that runs before any other ge
 | OI-05 | RAG — Past Project Reuse: vector store of past FSD/TSD sections for precedent retrieval | High | Phase 3 |
 | OI-06 | Multi-language output: Japanese (JERA), Arabic (Al Tayer) | Low | Phase 4 |
 | OI-07 | Prompt caching: implement Anthropic prompt caching for structured_summary across batch calls | Medium | Phase 2.1 |
+| OI-08 | Batching vs. interactivity tradeoff (FR-10a): confirm the increase in API call count and latency from single-section generation is acceptable, or consider a "fast mode" toggle that falls back to legacy batching | High | Phase 2.1 |
+| OI-09 | Confirm 5-attempt regeneration cap (FR-10) is the right ceiling before force-locking a section, and that the force-lock messaging is clear enough for a consultant to know manual review is needed | Medium | Phase 2.1 |
 
 ---
 

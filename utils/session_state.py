@@ -31,6 +31,24 @@ KEY_TSD_BATCH_STATUS = "tsd_batch_status"
 KEY_TSD_BYTES = "tsd_bytes"
 KEY_WORKFLOW_STEP = "workflow_step"
 
+# Interactive section-by-section generation loop (CLAUDE.md §3.7/§3.8a) — one entry
+# per doc type. locked_sections is keyed by section number: {content, question,
+# answer, revision_count, force_locked}. current_section_index points at the section
+# currently being drafted; draft/draft_prev/draft_feedback hold the in-flight draft
+# and the correction text used for the most recent regeneration.
+KEY_FSD_LOCKED_SECTIONS = "fsd_locked_sections"
+KEY_FSD_CURRENT_SECTION_INDEX = "fsd_current_section_index"
+KEY_FSD_CURRENT_DRAFT = "fsd_current_draft"
+KEY_FSD_REVISION_COUNT = "fsd_revision_count"
+KEY_FSD_DRAFT_PREV = "fsd_draft_prev"
+KEY_FSD_DRAFT_FEEDBACK = "fsd_draft_feedback"
+KEY_TSD_LOCKED_SECTIONS = "tsd_locked_sections"
+KEY_TSD_CURRENT_SECTION_INDEX = "tsd_current_section_index"
+KEY_TSD_CURRENT_DRAFT = "tsd_current_draft"
+KEY_TSD_REVISION_COUNT = "tsd_revision_count"
+KEY_TSD_DRAFT_PREV = "tsd_draft_prev"
+KEY_TSD_DRAFT_FEEDBACK = "tsd_draft_feedback"
+
 # Token usage / cost tracking (CHANGE 2 — token and cost footer)
 KEY_STEP_INPUT_TOKENS = "step_input_tokens"
 KEY_STEP_OUTPUT_TOKENS = "step_output_tokens"
@@ -70,6 +88,18 @@ _ALL_KEYS = [
     KEY_TSD_BATCH_STATUS,
     KEY_TSD_BYTES,
     KEY_WORKFLOW_STEP,
+    KEY_FSD_LOCKED_SECTIONS,
+    KEY_FSD_CURRENT_SECTION_INDEX,
+    KEY_FSD_CURRENT_DRAFT,
+    KEY_FSD_REVISION_COUNT,
+    KEY_FSD_DRAFT_PREV,
+    KEY_FSD_DRAFT_FEEDBACK,
+    KEY_TSD_LOCKED_SECTIONS,
+    KEY_TSD_CURRENT_SECTION_INDEX,
+    KEY_TSD_CURRENT_DRAFT,
+    KEY_TSD_REVISION_COUNT,
+    KEY_TSD_DRAFT_PREV,
+    KEY_TSD_DRAFT_FEEDBACK,
     KEY_STEP_INPUT_TOKENS,
     KEY_STEP_OUTPUT_TOKENS,
     KEY_SESSION_INPUT_TOKENS,
@@ -152,6 +182,12 @@ def init_session_state() -> None:
     for token_key in (KEY_STEP_INPUT_TOKENS, KEY_STEP_OUTPUT_TOKENS, KEY_SESSION_INPUT_TOKENS, KEY_SESSION_OUTPUT_TOKENS):
         if st.session_state[token_key] is None:
             st.session_state[token_key] = 0
+    for locked_key in (KEY_FSD_LOCKED_SECTIONS, KEY_TSD_LOCKED_SECTIONS):
+        if st.session_state[locked_key] is None:
+            st.session_state[locked_key] = {}
+    for index_key in (KEY_FSD_CURRENT_SECTION_INDEX, KEY_TSD_CURRENT_SECTION_INDEX, KEY_FSD_REVISION_COUNT, KEY_TSD_REVISION_COUNT):
+        if st.session_state[index_key] is None:
+            st.session_state[index_key] = 0
 
 
 def get(key: str):
@@ -178,6 +214,12 @@ def reset_all() -> None:
     st.session_state[KEY_STEP_OUTPUT_TOKENS] = 0
     st.session_state[KEY_SESSION_INPUT_TOKENS] = 0
     st.session_state[KEY_SESSION_OUTPUT_TOKENS] = 0
+    st.session_state[KEY_FSD_LOCKED_SECTIONS] = {}
+    st.session_state[KEY_TSD_LOCKED_SECTIONS] = {}
+    st.session_state[KEY_FSD_CURRENT_SECTION_INDEX] = 0
+    st.session_state[KEY_TSD_CURRENT_SECTION_INDEX] = 0
+    st.session_state[KEY_FSD_REVISION_COUNT] = 0
+    st.session_state[KEY_TSD_REVISION_COUNT] = 0
 
 
 def advance_to(step: int) -> None:

@@ -11,7 +11,7 @@
 | Field | Value |
 |---|---|
 | App Name | SAP EPM Design Agent |
-| Version | 2.0 |
+| Version | 2.1 |
 | Type | Streamlit Web Application |
 | AI Engine | Anthropic Claude API (anthropic Python SDK) |
 | Python Version | 3.11+ |
@@ -42,6 +42,7 @@ sap_epm_design_agent/
 │   ├── fsd_generator.py              # FSD batch generation orchestration
 │   ├── tsd_generator.py              # TSD batch generation orchestration
 │   ├── section_regenerator.py        # Single-section regeneration
+│   ├── interactive_generator.py      # Single-section generate/review/refine/lock loop
 │   └── document_builder.py           # python-docx assembly — named styles only
 │
 ├── skills/
@@ -144,13 +145,29 @@ sap_epm_design_agent/
 - Table of Contents is always page 3 (Word auto-field, not static text)
 - Alternating row shading on all tables: white / #D6E4F0
 
-### 3.7 Generation Architecture — Batching
+### 3.7 Generation Architecture — Interactive Section Loop (default)
 - FSD and TSD are NEVER generated in a single LLM call
-- Default batch size: 3 sections per call (configurable via GENERATION_BATCH_SIZE in .env)
-- Each batch call receives: structured_summary + technology_context + batch section specs
-- Failed batches are retried independently — completed sections are never discarded
-- Section content is stored in a dict keyed by section number during generation
-- Final document is assembled from the dict after all batches complete
+- The default generation mode as of v2.1 generates **exactly one section per LLM call**
+- Each call receives: structured_summary + technology_context + **all previously locked
+  sections' content and Q&A** + the single target section's spec
+- A section is not "generated" in the sense of being final until the user explicitly
+  approves it (blank/confirm response) — until then, it is a draft subject to
+  regeneration with feedback folded in
+- `interactive_generator.py` owns this loop: `generate_section_draft()`,
+  `apply_feedback_and_regenerate()`, `lock_section()`
+- Locked section state (content + Q&A history + revision count) is stored in session
+  state, keyed by section number, and passed forward to every subsequent section's prompt
+- Maximum regeneration attempts per section: `MAX_SECTION_REGENERATION_ATTEMPTS` in
+  .env (default 5). If exceeded, the section is force-locked using the latest draft and
+  flagged in the Open Questions Register
+- Failed generation calls are retried independently (via `llm_client.py`) — locked
+  sections are never discarded or regenerated as a side effect of a later failure
+- Final document is assembled from the locked-sections dict once every section is locked
+- The legacy adaptive batching approach (grouping multiple sections into one call via
+  `SECTION_WEIGHT` / `_BATCH_QUOTA` in `fsd_generator.py`/`tsd_generator.py`) remains in
+  the codebase as an optional fallback "fast mode" only, gated behind
+  `INTERACTIVE_GENERATION=false` in .env — it must never run concurrently with the
+  interactive loop for the same document
 
 ### 3.8 BRD Pre-Summarisation Contract
 - `core/brd_summariser.py` performs the pre-summarisation LLM call
@@ -159,6 +176,22 @@ sap_epm_design_agent/
   `requirements`, `kpis`, `data_sources`, `domain`, `key_entities`, `open_gaps`
 - This dict — NOT raw BRD text — is passed to ALL subsequent LLM calls
 - Raw BRD text is NEVER passed to FSD or TSD generation prompts
+
+### 3.8a Interactive Section Loop Contract
+- `core/interactive_generator.py` is the only module allowed to orchestrate the
+  generate → present → review → lock cycle
+- Each section generation call must include **one and only one** target section in the
+  prompt — never multiple sections per call while this mode is active
+- A section carries a status of exactly one of: `pending`, `current`, `locked`
+- `locked_sections: dict` in session state stores, per section number: final content,
+  the targeted question asked (if any), the user's answer/correction text, and a
+  revision count
+- The targeted question is generated as part of the same call that drafts the section
+  content — never a separate call
+- `app.py` renders section status from `locked_sections` and the current section's live
+  draft — it must not track duplicate state of its own
+- Maximum 1 targeted question per section per generation attempt — no multi-question
+  batches inside the interactive loop
 
 ### 3.9 Two-Phase Workflow Contract
 - Phase 1 (FSD) and Phase 2 (TSD) are separate, sequential workflow stages
@@ -182,6 +215,8 @@ MAX_TOKENS_BATCH=4000
 GENERATION_BATCH_SIZE=3
 MAX_FILE_SIZE_MB=50
 APP_TITLE=SAP EPM Design Agent
+INTERACTIVE_GENERATION=true                # false reverts to legacy batched blind generation
+MAX_SECTION_REGENERATION_ATTEMPTS=5
 ```
 
 ---
@@ -232,6 +267,11 @@ APP_TITLE=SAP EPM Design Agent
 - Every LLM call shows `st.spinner()` with a descriptive label including section numbers
 - Multi-step generation uses `st.status()` with per-batch progress updates
 - Section regeneration uses a `st.selectbox` listing section numbers + titles
+- The step navigator (left panel) renders section status (locked / current / pending)
+  from `locked_sections` and the active section pointer only — never inferred from
+  document byte content
+- Every regeneration triggered by user feedback shows `st.spinner()` labelled with the
+  section name and current attempt count (e.g. "Refining Section 5 — attempt 2 of 5")
 
 ### Document Builder
 - Named styles are registered once at document creation in `_register_epm_styles(doc)`
@@ -311,6 +351,12 @@ store in section_content_dict
 - ❌ Generate all 14 sections in a single API call
 - ❌ Create a new Jinja2 `Environment` inside a `core/` module — use `utils/jinja_env.py`
 - ❌ Start TSD generation before FSD is complete and downloaded
+- ❌ Generate more than one section per LLM call while `INTERACTIVE_GENERATION=true`
+- ❌ Advance to the next section before the current one is explicitly locked
+- ❌ Ask more than one open question per section — no multi-question batches inside the
+  interactive loop
+- ❌ Run `interactive_generator.py` and the legacy `split_into_batches` path for the
+  same document generation
 
 ---
 
@@ -324,6 +370,10 @@ store in section_content_dict
   with/without answers, section content dict assembly
 - `test_document_builder.py`: named styles registered, cover page present, TOC field
   present, table header shading, alternating row colours
+- `test_interactive_generator.py`: single-section call contract (never >1 section per
+  prompt), locked_sections state accumulation across sections, regeneration attempt
+  counter and 5-attempt force-lock behaviour, context carry-forward (later sections'
+  prompts contain earlier locked content)
 - Run all: `pytest tests/ -v`
 
 ---
@@ -349,9 +399,10 @@ When entering Plan Mode, use this prompt verbatim:
 ```
 Read CLAUDE.md completely first.
 Then read docs/SAP_EPM_Design_Agent_FSD.md.
-The FSD is version 2.0. The existing code is version 1.0.
-Create a detailed implementation plan for upgrading the codebase from v1.0 to v2.0.
-The plan must cover every changed or new file listed in Section 12.1 of the FSD.
+The FSD is version 2.1. The existing code is version 2.0.
+Create a detailed implementation plan for upgrading the codebase from v2.0 to v2.1.
+The plan must cover every changed or new file listed in Section 4.4 (FR-10, FR-10a) and
+Section 4.5 (FR-15) of the FSD, plus the Interactive Section Loop Contract in CLAUDE.md §3.8a.
 Group changes into logical implementation phases.
 Do not write any code yet — plan only.
 Highlight any ambiguities you find before proceeding.
@@ -359,4 +410,4 @@ Highlight any ambiguities you find before proceeding.
 ```
 ---
 
-*Last updated: July 2025 | Version 2.0 | SAP EPM Design Agent*
+*Last updated: July 2026 | Version 2.1 | SAP EPM Design Agent*

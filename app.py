@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from core import fsd_generator as fsd_gen
+from core import interactive_generator as interactive_gen
 from core import tsd_generator as tsd_gen
 from core.brd_parser import BRDParseError, build_combined_input, parse_brd, parse_supporting_docs
 from core.brd_summariser import BRDSummariserError, generate_structured_summary
@@ -38,8 +39,14 @@ from utils.session_state import (
     KEY_DISCUSSION_NOTES,
     KEY_FSD_BATCH_STATUS,
     KEY_FSD_BYTES,
+    KEY_FSD_CURRENT_DRAFT,
+    KEY_FSD_CURRENT_SECTION_INDEX,
+    KEY_FSD_DRAFT_FEEDBACK,
+    KEY_FSD_DRAFT_PREV,
     KEY_FSD_FULL_TEXT,
     KEY_FSD_GENERATED_AT,
+    KEY_FSD_LOCKED_SECTIONS,
+    KEY_FSD_REVISION_COUNT,
     KEY_FSD_SECTION_CONTENT,
     KEY_FSD_SECTION_STRUCTURE,
     KEY_FSD_TEMPLATE,
@@ -57,7 +64,13 @@ from utils.session_state import (
     KEY_TECHNOLOGY_AUTO,
     KEY_TSD_BATCH_STATUS,
     KEY_TSD_BYTES,
+    KEY_TSD_CURRENT_DRAFT,
+    KEY_TSD_CURRENT_SECTION_INDEX,
+    KEY_TSD_DRAFT_FEEDBACK,
+    KEY_TSD_DRAFT_PREV,
     KEY_TSD_GENERATED_AT,
+    KEY_TSD_LOCKED_SECTIONS,
+    KEY_TSD_REVISION_COUNT,
     KEY_TSD_SECTION_CONTENT,
     KEY_TSD_SECTION_STRUCTURE,
     KEY_TSD_TEMPLATE,
@@ -86,6 +99,11 @@ from utils.session_state import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 APP_TITLE = os.getenv("APP_TITLE", "SAP EPM Design Agent")
+
+# CLAUDE.md §3.7: the interactive per-section loop is the default. Setting this to
+# false in .env falls back to the legacy batched generation path — the two must
+# never run concurrently for the same document.
+INTERACTIVE_GENERATION = os.getenv("INTERACTIVE_GENERATION", "true").strip().lower() != "false"
 
 
 # ---------------------------------------------------------------------------
@@ -256,24 +274,38 @@ def _apply_custom_styles() -> None:
 # CHANGE 1 — Left-hand step navigator
 # ---------------------------------------------------------------------------
 
-_NAV_STEPS = [
-    (STEP_UPLOAD, "Phase 1 — FSD Generation", "Upload BRD", "Upload the mandatory requirements document"),
-    (STEP_ADDITIONAL_INPUT, None, "Supporting Docs & Metadata", "Optional files, notes, and project details"),
-    (STEP_SELECT_TECHNOLOGY, None, "Select Technology", "Choose target SAP technology and templates"),
-    (STEP_ANALYSE, None, "Analyse Input", "Pre-summarise input, detect domain(s)"),
-    (STEP_QUESTIONS, None, "Clarification Questions", "Answer or skip agent questions"),
-    (STEP_GENERATE_FSD, None, "Generate FSD", "Batched generation of 14 FSD sections"),
-    (STEP_FSD_DOWNLOAD, None, "FSD Download / Regenerate", "Download FSD or redo a section"),
-    (STEP_TSD_INPUT, "Phase 2 — TSD Generation", "TSD Input", "Confirm FSD source and TSD template"),
-    (STEP_GENERATE_TSD, None, "Generate TSD", "Batched generation of 14 TSD sections"),
-    (STEP_TSD_DOWNLOAD, None, "TSD Download / Regenerate", "Download TSD or redo a section"),
-]
+def _build_nav_steps() -> list:
+    """Return the left-hand phase/step list — FSD/TSD generation descriptions reflect
+    whether the interactive per-section loop or the legacy batched fallback is active."""
+    gen_desc = (
+        "Interactive section-by-section generate / review / lock loop"
+        if INTERACTIVE_GENERATION
+        else "Batched generation of 14 sections (legacy fast mode)"
+    )
+    steps = [
+        (STEP_UPLOAD, "Phase 1 — FSD Generation", "Upload BRD", "Upload the mandatory requirements document"),
+        (STEP_ADDITIONAL_INPUT, None, "Supporting Docs & Metadata", "Optional files, notes, and project details"),
+        (STEP_SELECT_TECHNOLOGY, None, "Select Technology", "Choose target SAP technology and templates"),
+        (STEP_ANALYSE, None, "Analyse Input", "Pre-summarise input, detect domain(s)"),
+    ]
+    if not INTERACTIVE_GENERATION:
+        # Superseded in interactive mode by the per-section targeted question (FR-09) —
+        # the legacy batched fallback still needs its upfront clarification pass.
+        steps.append((STEP_QUESTIONS, None, "Clarification Questions", "Answer or skip agent questions"))
+    steps += [
+        (STEP_GENERATE_FSD, None, "Generate FSD", gen_desc),
+        (STEP_FSD_DOWNLOAD, None, "FSD Download / Regenerate", "Download FSD or redo a section"),
+        (STEP_TSD_INPUT, "Phase 2 — TSD Generation", "TSD Input", "Confirm FSD source and TSD template"),
+        (STEP_GENERATE_TSD, None, "Generate TSD", gen_desc),
+        (STEP_TSD_DOWNLOAD, None, "TSD Download / Regenerate", "Download TSD or redo a section"),
+    ]
+    return steps
 
 
 def _render_step_navigator(current_step: int) -> None:
     """Render the persistent left-hand workflow step navigator (updates from session state)."""
     parts = ['<div class="epm-nav-panel">']
-    for step_num, phase_header, label, desc in _NAV_STEPS:
+    for step_num, phase_header, label, desc in _build_nav_steps():
         if phase_header:
             parts.append(f'<div class="epm-nav-phase">{html.escape(phase_header)}</div>')
         if current_step > step_num:
@@ -297,6 +329,40 @@ def _render_step_navigator(current_step: int) -> None:
         if st.button("Reset", key="sidebar_reset", use_container_width=True):
             reset_all()
             st.rerun()
+
+
+def _section_status_label(entry: dict | None, is_current: bool) -> tuple:
+    """Return (icon, css_class, status_text) for one section's nav row.
+
+    Rendered ONLY from a locked_sections entry and the active section pointer —
+    never inferred from document byte content (CLAUDE.md §3.8a).
+    """
+    if entry is not None:
+        rev = entry.get("revision_count", 0)
+        status = f"locked (rev {rev})" if rev else "locked"
+        if entry.get("force_locked"):
+            status += " ⚠️ manual review"
+        return "✅", "epm-nav-done", status
+    if is_current:
+        return "▶", "epm-nav-current", "current"
+    return "○", "epm-nav-pending", "pending"
+
+
+def _render_section_status_nav(section_structure: list, locked_sections: dict, current_index: int) -> None:
+    """Render locked/current/pending status for every FSD or TSD section (FR-10)."""
+    parts = ['<div class="epm-nav-panel" style="margin-top:0.75rem;">', '<div class="epm-nav-phase">Sections</div>']
+    for i, section in enumerate(section_structure):
+        entry = locked_sections.get(section["number"])
+        icon, css_class, status = _section_status_label(entry, i == current_index)
+        parts.append(
+            f'<div class="epm-nav-step {css_class}">'
+            f'<span class="epm-nav-icon">{icon}</span>'
+            f'<span><span class="epm-nav-label">{html.escape(section["number"])}. {html.escape(section["title"])}</span>'
+            f'<span class="epm-nav-desc">{html.escape(status)}</span></span>'
+            f"</div>"
+        )
+    parts.append("</div>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +565,130 @@ def _section_options(section_structure: list) -> list:
     return [f"{s['number']}. {s['title']}" for s in section_structure]
 
 
+# ---------------------------------------------------------------------------
+# Interactive generate -> review -> refine -> lock loop (CLAUDE.md §3.7/§3.8a)
+# Shared by both FSD and TSD generation steps — the loop logic itself lives in
+# core/interactive_generator.py; this function is UI plumbing only.
+# ---------------------------------------------------------------------------
+
+def _generate_or_regenerate_draft(loop_keys: dict, locked_sections: dict, target_section: dict, instructions: str, revision_count: int, max_attempts: int):
+    """Call the LLM once for the current section: first draft, or a feedback regen."""
+    doc_type = loop_keys["doc_type"]
+    num = target_section["number"]
+    label = (
+        f"Generating {doc_type} Section {num} — {target_section['title']}…"
+        if revision_count == 0
+        else f"Refining {doc_type} Section {num} — attempt {revision_count} of {max_attempts}…"
+    )
+    with st.spinner(label):
+        if revision_count == 0:
+            return loop_keys["generate_draft"](locked_sections, target_section, instructions)
+        previous_draft = get(loop_keys["draft_prev_key"])
+        feedback_text = get(loop_keys["draft_feedback_key"])
+        return loop_keys["regenerate_draft"](locked_sections, target_section, instructions, previous_draft, feedback_text)
+
+
+def _render_draft_review(draft: dict, num: str, title: str) -> tuple:
+    """Show the current draft + any targeted question, and return the two action button states."""
+    st.markdown(f"#### Section {num}: {title}")
+    st.markdown(draft["content"])
+    if draft.get("question"):
+        st.info(f"**Targeted question:** {draft['question']}")
+
+    correction_text = st.text_input(
+        "Does this look right? Leave blank to approve, or describe a correction to regenerate.",
+        key=f"correction_input_{num}_{draft.get('question') or ''}_{len(draft.get('content') or '')}",
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        approve = st.button("✅ Approve & Lock", type="primary", key=f"approve_{num}_{id(draft)}")
+    with col2:
+        correct = st.button("🔁 Submit Correction & Regenerate", key=f"correct_{num}_{id(draft)}")
+    return correction_text, approve, correct
+
+
+def _render_interactive_loop(loop_keys: dict) -> None:
+    """Drive one step of the interactive section loop for either FSD or TSD.
+
+    `loop_keys` bundles the doc-type-specific session keys and callables so the
+    loop logic (owned by core/interactive_generator.py) is written exactly once.
+    """
+    doc_type = loop_keys["doc_type"]
+    section_structure = loop_keys["section_structure"]
+    locked_sections = get(loop_keys["locked_key"]) or {}
+    current_index = get(loop_keys["index_key"]) or 0
+    revision_count = get(loop_keys["revision_key"]) or 0
+    draft = get(loop_keys["draft_key"])
+    max_attempts = interactive_gen.get_max_regeneration_attempts()
+
+    if current_index >= len(section_structure):
+        _finalise_interactive_document(loop_keys, section_structure, locked_sections)
+        return
+
+    target_section = section_structure[current_index]
+    num = target_section["number"]
+    instructions = loop_keys["section_instructions"].get(num, target_section["description"])
+
+    if draft is None:
+        try:
+            draft = _generate_or_regenerate_draft(loop_keys, locked_sections, target_section, instructions, revision_count, max_attempts)
+            _track_usage()
+            set_value(loop_keys["draft_key"], draft)
+        except LLMError as exc:
+            st.error(f"❌ {doc_type} Section {num} generation failed: {exc}")
+            return
+
+    correction_text, approve, correct = _render_draft_review(draft, num, target_section["title"])
+
+    if approve:
+        _lock_and_advance(loop_keys, locked_sections, current_index, num, draft, correction_text, revision_count, force_locked=False)
+    elif correct:
+        _handle_correction(loop_keys, locked_sections, current_index, num, draft, correction_text, revision_count, max_attempts)
+
+
+def _handle_correction(loop_keys: dict, locked_sections: dict, current_index: int, num: str, draft: dict, correction_text: str, revision_count: int, max_attempts: int) -> None:
+    """Either force-lock the latest draft (cap reached) or queue a feedback regeneration."""
+    if not correction_text.strip():
+        st.warning("Enter a correction, or use Approve & Lock to accept the draft as-is.")
+    elif interactive_gen.should_force_lock(revision_count):
+        _lock_and_advance(loop_keys, locked_sections, current_index, num, draft, correction_text, revision_count, force_locked=True)
+        st.warning(f"⚠️ Section {num} force-locked after {max_attempts} regeneration attempt(s) — flagged for manual review.")
+    else:
+        set_value(loop_keys["draft_prev_key"], draft)
+        set_value(loop_keys["draft_feedback_key"], correction_text)
+        set_value(loop_keys["revision_key"], revision_count + 1)
+        set_value(loop_keys["draft_key"], None)
+        st.rerun()
+
+
+def _lock_and_advance(loop_keys: dict, locked_sections: dict, current_index: int, num: str, draft: dict, answer_text: str, revision_count: int, force_locked: bool) -> None:
+    """Lock the current section, reset per-section state, and move to the next one."""
+    locked_sections = interactive_gen.lock_section(locked_sections, num, draft, answer_text, revision_count, force_locked)
+    set_value(loop_keys["locked_key"], locked_sections)
+    set_value(loop_keys["index_key"], current_index + 1)
+    set_value(loop_keys["revision_key"], 0)
+    set_value(loop_keys["draft_key"], None)
+    set_value(loop_keys["draft_prev_key"], None)
+    set_value(loop_keys["draft_feedback_key"], None)
+    st.rerun()
+
+
+def _finalise_interactive_document(loop_keys: dict, section_structure: list, locked_sections: dict) -> None:
+    """All sections locked: flag force-locked ones, assemble the document, advance the workflow."""
+    final_locked = interactive_gen.append_open_questions_addendum(locked_sections, section_structure)
+    if final_locked != locked_sections:
+        set_value(loop_keys["locked_key"], final_locked)
+        locked_sections = final_locked
+
+    content_dict = {num: entry["content"] for num, entry in locked_sections.items()}
+    set_value(loop_keys["content_key"], content_dict)
+    doc_bytes = loop_keys["build_document"](content_dict)
+    set_value(loop_keys["bytes_key"], doc_bytes)
+    set_value(loop_keys["generated_at_key"], datetime.now())
+    advance_to(loop_keys["next_step"])
+    st.rerun()
+
+
 st.set_page_config(
     page_title=APP_TITLE,
     page_icon="📋",
@@ -515,6 +705,12 @@ nav_col, main_col = st.columns([0.22, 0.78], gap="large")
 
 with nav_col:
     _render_step_navigator(current_step)
+    if INTERACTIVE_GENERATION and current_step == STEP_GENERATE_FSD:
+        fsd_nav_structure = get(KEY_FSD_SECTION_STRUCTURE) or fsd_gen.resolve_section_structure(get(KEY_FSD_TEMPLATE))
+        _render_section_status_nav(fsd_nav_structure, get(KEY_FSD_LOCKED_SECTIONS) or {}, get(KEY_FSD_CURRENT_SECTION_INDEX) or 0)
+    elif INTERACTIVE_GENERATION and current_step == STEP_GENERATE_TSD:
+        tsd_nav_structure = get(KEY_TSD_SECTION_STRUCTURE) or tsd_gen.resolve_section_structure(get(KEY_TSD_TEMPLATE))
+        _render_section_status_nav(tsd_nav_structure, get(KEY_TSD_LOCKED_SECTIONS) or {}, get(KEY_TSD_CURRENT_SECTION_INDEX) or 0)
 
 with main_col:
     # ---------------------------------------------------------------------------
@@ -696,11 +892,21 @@ with main_col:
     # ---------------------------------------------------------------------------
 
     if current_step >= STEP_ANALYSE and get(KEY_BRD_DICT) and get(KEY_TECHNOLOGY):
-        with st.expander("**Step 4 — Analyse Input and Generate Clarification Questions**", expanded=(current_step == STEP_ANALYSE)):
+        step4_title = (
+            "**Step 4 — Analyse Input**"
+            if INTERACTIVE_GENERATION
+            else "**Step 4 — Analyse Input and Generate Clarification Questions**"
+        )
+        with st.expander(step4_title, expanded=(current_step == STEP_ANALYSE)):
             st.markdown(
                 "The agent will pre-summarise all input (BRD, supporting documents, and discussion notes) into a "
                 "structured requirements dict, auto-detect the relevant functional domain(s), and identify any gaps."
             )
+            if INTERACTIVE_GENERATION:
+                st.caption(
+                    "Clarification is now handled inline: each FSD/TSD section may surface at most one "
+                    "targeted question while it is being drafted, instead of an upfront question batch."
+                )
 
             awaiting_tech_confirmation = (
                 get(KEY_TECHNOLOGY_AUTO)
@@ -727,6 +933,12 @@ with main_col:
 
                         if get(KEY_TECHNOLOGY_AUTO):
                             set_value(KEY_RECOMMENDED_TECHNOLOGIES, structured_summary.get("recommended_technologies") or [])
+                            st.rerun()
+                        elif INTERACTIVE_GENERATION:
+                            # FR-09/CLAUDE.md §3.7: the upfront clarification batch is
+                            # superseded by per-section targeted questions in the loop.
+                            set_value(KEY_ANSWERS, {})
+                            advance_to(STEP_GENERATE_FSD)
                             st.rerun()
                         else:
                             domain_skills = load_domain_skills(structured_summary["domain"])
@@ -760,29 +972,37 @@ with main_col:
                     key="tech_recommendation_confirm",
                 )
 
-                if st.button("✅ Accept & Generate Clarification Questions", type="primary", key="confirm_recommendation_btn"):
+                accept_label = "✅ Accept & Continue" if INTERACTIVE_GENERATION else "✅ Accept & Generate Clarification Questions"
+                if st.button(accept_label, type="primary", key="confirm_recommendation_btn"):
                     if not confirmed_technologies:
                         st.error("❌ Please select at least one SAP technology to proceed.")
                     else:
                         set_value(KEY_TECHNOLOGIES, confirmed_technologies)
                         set_value(KEY_TECHNOLOGY, "+".join(confirmed_technologies))
 
-                        try:
-                            structured_summary = get(KEY_STRUCTURED_SUMMARY)
-                            sap_skill = load_sap_skill(get(KEY_TECHNOLOGY))
-                            domain_skills = load_domain_skills(structured_summary["domain"])
-                            questions = generate_questions(
-                                structured_summary=structured_summary,
-                                technology=get(KEY_TECHNOLOGY),
-                                sap_skill=sap_skill,
-                                domain_skills=domain_skills,
-                            )
-                            _track_usage()
-                            set_value(KEY_QUESTIONS, questions)
-                            advance_to(STEP_QUESTIONS)
+                        if INTERACTIVE_GENERATION:
+                            # FR-09/CLAUDE.md §3.7: the upfront clarification batch is
+                            # superseded by per-section targeted questions in the loop.
+                            set_value(KEY_ANSWERS, {})
+                            advance_to(STEP_GENERATE_FSD)
                             st.rerun()
-                        except LLMError as exc:
-                            st.error(f"❌ Clarification question generation failed: {exc}")
+                        else:
+                            try:
+                                structured_summary = get(KEY_STRUCTURED_SUMMARY)
+                                sap_skill = load_sap_skill(get(KEY_TECHNOLOGY))
+                                domain_skills = load_domain_skills(structured_summary["domain"])
+                                questions = generate_questions(
+                                    structured_summary=structured_summary,
+                                    technology=get(KEY_TECHNOLOGY),
+                                    sap_skill=sap_skill,
+                                    domain_skills=domain_skills,
+                                )
+                                _track_usage()
+                                set_value(KEY_QUESTIONS, questions)
+                                advance_to(STEP_QUESTIONS)
+                                st.rerun()
+                            except LLMError as exc:
+                                st.error(f"❌ Clarification question generation failed: {exc}")
 
             if get(KEY_STRUCTURED_SUMMARY) and current_step > STEP_ANALYSE:
                 domains = get(KEY_DETECTED_DOMAINS) or []
@@ -792,7 +1012,7 @@ with main_col:
     # Step 5 — Clarification Questions
     # ---------------------------------------------------------------------------
 
-    if current_step >= STEP_QUESTIONS and get(KEY_QUESTIONS) is not None:
+    if not INTERACTIVE_GENERATION and current_step >= STEP_QUESTIONS and get(KEY_QUESTIONS) is not None:
         questions = get(KEY_QUESTIONS)
 
         with st.expander("**Step 5 — Clarification Questions**", expanded=(current_step == STEP_QUESTIONS)):
@@ -839,7 +1059,7 @@ with main_col:
                     st.rerun()
 
     # ---------------------------------------------------------------------------
-    # Step 6 — Batched FSD Generation
+    # Step 6 — FSD Generation (interactive per-section loop, or legacy batch fallback)
     # ---------------------------------------------------------------------------
 
     if current_step == STEP_GENERATE_FSD:
@@ -849,45 +1069,97 @@ with main_col:
                 section_structure = fsd_gen.resolve_section_structure(get(KEY_FSD_TEMPLATE))
                 set_value(KEY_FSD_SECTION_STRUCTURE, section_structure)
 
-            batches = fsd_gen.split_into_batches(section_structure)
-            completed, failed_index = _render_batch_progress(section_structure, batches, KEY_FSD_BATCH_STATUS)
-            st.progress(completed / len(batches) if batches else 1.0)
-
-            if not (failed_index is None and completed >= len(batches)):
-                _render_section_tiles(section_structure, batches, get(KEY_FSD_BATCH_STATUS) or ["pending"] * len(batches))
-
             sap_skill = load_sap_skill(get(KEY_TECHNOLOGY))
             domain_skills = load_domain_skills(get(KEY_DETECTED_DOMAINS))
 
-            def _generate_one_fsd_batch(batch):
-                return fsd_gen.generate_fsd_batch(
-                    structured_summary=get(KEY_STRUCTURED_SUMMARY),
-                    technology=get(KEY_TECHNOLOGY),
-                    sap_skill=sap_skill,
-                    domain_skills=domain_skills,
-                    clarification_answers=get(KEY_ANSWERS) or {},
-                    metadata=get(KEY_METADATA),
-                    section_structure=section_structure,
-                    batch_sections=batch,
-                )
+            if INTERACTIVE_GENERATION:
+                def _fsd_generate_draft(locked_sections, target_section, instructions):
+                    return interactive_gen.generate_section_draft(
+                        doc_type="FSD",
+                        structured_summary=get(KEY_STRUCTURED_SUMMARY),
+                        technology=get(KEY_TECHNOLOGY),
+                        sap_skill=sap_skill,
+                        domain_skills=domain_skills,
+                        clarification_answers=get(KEY_ANSWERS) or {},
+                        metadata=get(KEY_METADATA),
+                        section_structure=section_structure,
+                        locked_sections=locked_sections,
+                        target_section=target_section,
+                        instructions=instructions,
+                    )
 
-            if failed_index is not None:
-                batch = batches[failed_index]
-                st.error(f"Batch {failed_index + 1} (Sections {batch[0]['number']}–{batch[-1]['number']}) failed to generate.")
-                if st.button("🔁 Retry Failed Batch", type="primary", key="retry_fsd_batch_btn"):
-                    _reset_failed_batch(KEY_FSD_BATCH_STATUS, failed_index)
-                    _run_batches("FSD", batches, section_structure, KEY_FSD_SECTION_CONTENT, KEY_FSD_BATCH_STATUS, _generate_one_fsd_batch)
-                    st.rerun()
-            elif completed < len(batches):
-                if st.button("⚡ Generate FSD", type="primary", key="run_fsd_batches_btn"):
-                    _run_batches("FSD", batches, section_structure, KEY_FSD_SECTION_CONTENT, KEY_FSD_BATCH_STATUS, _generate_one_fsd_batch)
-                    st.rerun()
+                def _fsd_regenerate_draft(locked_sections, target_section, instructions, previous_draft, feedback_text):
+                    return interactive_gen.apply_feedback_and_regenerate(
+                        doc_type="FSD",
+                        structured_summary=get(KEY_STRUCTURED_SUMMARY),
+                        technology=get(KEY_TECHNOLOGY),
+                        sap_skill=sap_skill,
+                        domain_skills=domain_skills,
+                        clarification_answers=get(KEY_ANSWERS) or {},
+                        metadata=get(KEY_METADATA),
+                        section_structure=section_structure,
+                        locked_sections=locked_sections,
+                        target_section=target_section,
+                        instructions=instructions,
+                        previous_draft=previous_draft,
+                        feedback_text=feedback_text,
+                    )
+
+                _render_interactive_loop({
+                    "doc_type": "FSD",
+                    "section_structure": section_structure,
+                    "locked_key": KEY_FSD_LOCKED_SECTIONS,
+                    "index_key": KEY_FSD_CURRENT_SECTION_INDEX,
+                    "draft_key": KEY_FSD_CURRENT_DRAFT,
+                    "revision_key": KEY_FSD_REVISION_COUNT,
+                    "draft_prev_key": KEY_FSD_DRAFT_PREV,
+                    "draft_feedback_key": KEY_FSD_DRAFT_FEEDBACK,
+                    "section_instructions": fsd_gen.FSD_SECTION_INSTRUCTIONS,
+                    "generate_draft": _fsd_generate_draft,
+                    "regenerate_draft": _fsd_regenerate_draft,
+                    "content_key": KEY_FSD_SECTION_CONTENT,
+                    "bytes_key": KEY_FSD_BYTES,
+                    "build_document": lambda content_dict: fsd_gen.build_fsd_bytes(content_dict, section_structure, get(KEY_TECHNOLOGY), get(KEY_METADATA)),
+                    "generated_at_key": KEY_FSD_GENERATED_AT,
+                    "next_step": STEP_FSD_DOWNLOAD,
+                })
             else:
-                fsd_bytes = fsd_gen.build_fsd_bytes(get(KEY_FSD_SECTION_CONTENT), section_structure, get(KEY_TECHNOLOGY), get(KEY_METADATA))
-                set_value(KEY_FSD_BYTES, fsd_bytes)
-                set_value(KEY_FSD_GENERATED_AT, datetime.now())
-                advance_to(STEP_FSD_DOWNLOAD)
-                st.rerun()
+                batches = fsd_gen.split_into_batches(section_structure)
+                completed, failed_index = _render_batch_progress(section_structure, batches, KEY_FSD_BATCH_STATUS)
+                st.progress(completed / len(batches) if batches else 1.0)
+
+                if not (failed_index is None and completed >= len(batches)):
+                    _render_section_tiles(section_structure, batches, get(KEY_FSD_BATCH_STATUS) or ["pending"] * len(batches))
+
+                def _generate_one_fsd_batch(batch):
+                    return fsd_gen.generate_fsd_batch(
+                        structured_summary=get(KEY_STRUCTURED_SUMMARY),
+                        technology=get(KEY_TECHNOLOGY),
+                        sap_skill=sap_skill,
+                        domain_skills=domain_skills,
+                        clarification_answers=get(KEY_ANSWERS) or {},
+                        metadata=get(KEY_METADATA),
+                        section_structure=section_structure,
+                        batch_sections=batch,
+                    )
+
+                if failed_index is not None:
+                    batch = batches[failed_index]
+                    st.error(f"Batch {failed_index + 1} (Sections {batch[0]['number']}–{batch[-1]['number']}) failed to generate.")
+                    if st.button("🔁 Retry Failed Batch", type="primary", key="retry_fsd_batch_btn"):
+                        _reset_failed_batch(KEY_FSD_BATCH_STATUS, failed_index)
+                        _run_batches("FSD", batches, section_structure, KEY_FSD_SECTION_CONTENT, KEY_FSD_BATCH_STATUS, _generate_one_fsd_batch)
+                        st.rerun()
+                elif completed < len(batches):
+                    if st.button("⚡ Generate FSD", type="primary", key="run_fsd_batches_btn"):
+                        _run_batches("FSD", batches, section_structure, KEY_FSD_SECTION_CONTENT, KEY_FSD_BATCH_STATUS, _generate_one_fsd_batch)
+                        st.rerun()
+                else:
+                    fsd_bytes = fsd_gen.build_fsd_bytes(get(KEY_FSD_SECTION_CONTENT), section_structure, get(KEY_TECHNOLOGY), get(KEY_METADATA))
+                    set_value(KEY_FSD_BYTES, fsd_bytes)
+                    set_value(KEY_FSD_GENERATED_AT, datetime.now())
+                    advance_to(STEP_FSD_DOWNLOAD)
+                    st.rerun()
 
     # ---------------------------------------------------------------------------
     # Step 7 — FSD Download, Section Regeneration, Proceed to TSD Gate
@@ -998,7 +1270,7 @@ with main_col:
                     st.error(f"❌ {exc}")
 
     # ---------------------------------------------------------------------------
-    # Step 9 — Batched TSD Generation
+    # Step 9 — TSD Generation (interactive per-section loop, or legacy batch fallback)
     # ---------------------------------------------------------------------------
 
     if current_step == STEP_GENERATE_TSD:
@@ -1008,46 +1280,100 @@ with main_col:
                 tsd_section_structure = tsd_gen.resolve_section_structure(get(KEY_TSD_TEMPLATE))
                 set_value(KEY_TSD_SECTION_STRUCTURE, tsd_section_structure)
 
-            tsd_batches = tsd_gen.split_into_batches(tsd_section_structure)
-            completed, failed_index = _render_batch_progress(tsd_section_structure, tsd_batches, KEY_TSD_BATCH_STATUS)
-            st.progress(completed / len(tsd_batches) if tsd_batches else 1.0)
-
-            if not (failed_index is None and completed >= len(tsd_batches)):
-                _render_section_tiles(tsd_section_structure, tsd_batches, get(KEY_TSD_BATCH_STATUS) or ["pending"] * len(tsd_batches))
-
             sap_skill = load_sap_skill(get(KEY_TECHNOLOGY))
             domain_skills = load_domain_skills(get(KEY_DETECTED_DOMAINS))
 
-            def _generate_one_tsd_batch(batch):
-                return tsd_gen.generate_tsd_batch(
-                    fsd_full_text=get(KEY_FSD_FULL_TEXT),
-                    technology=get(KEY_TECHNOLOGY),
-                    sap_skill=sap_skill,
-                    domain_skills=domain_skills,
-                    structured_summary=get(KEY_STRUCTURED_SUMMARY),
-                    clarification_answers=get(KEY_ANSWERS) or {},
-                    metadata=get(KEY_METADATA),
-                    section_structure=tsd_section_structure,
-                    batch_sections=batch,
-                )
+            if INTERACTIVE_GENERATION:
+                def _tsd_generate_draft(locked_sections, target_section, instructions):
+                    return interactive_gen.generate_section_draft(
+                        doc_type="TSD",
+                        structured_summary=get(KEY_STRUCTURED_SUMMARY),
+                        technology=get(KEY_TECHNOLOGY),
+                        sap_skill=sap_skill,
+                        domain_skills=domain_skills,
+                        clarification_answers=get(KEY_ANSWERS) or {},
+                        metadata=get(KEY_METADATA),
+                        section_structure=tsd_section_structure,
+                        locked_sections=locked_sections,
+                        target_section=target_section,
+                        instructions=instructions,
+                        fsd_full_text=get(KEY_FSD_FULL_TEXT),
+                    )
 
-            if failed_index is not None:
-                batch = tsd_batches[failed_index]
-                st.error(f"Batch {failed_index + 1} (Sections {batch[0]['number']}–{batch[-1]['number']}) failed to generate.")
-                if st.button("🔁 Retry Failed Batch", type="primary", key="retry_tsd_batch_btn"):
-                    _reset_failed_batch(KEY_TSD_BATCH_STATUS, failed_index)
-                    _run_batches("TSD", tsd_batches, tsd_section_structure, KEY_TSD_SECTION_CONTENT, KEY_TSD_BATCH_STATUS, _generate_one_tsd_batch)
-                    st.rerun()
-            elif completed < len(tsd_batches):
-                if st.button("⚡ Generate TSD", type="primary", key="run_tsd_batches_btn"):
-                    _run_batches("TSD", tsd_batches, tsd_section_structure, KEY_TSD_SECTION_CONTENT, KEY_TSD_BATCH_STATUS, _generate_one_tsd_batch)
-                    st.rerun()
+                def _tsd_regenerate_draft(locked_sections, target_section, instructions, previous_draft, feedback_text):
+                    return interactive_gen.apply_feedback_and_regenerate(
+                        doc_type="TSD",
+                        structured_summary=get(KEY_STRUCTURED_SUMMARY),
+                        technology=get(KEY_TECHNOLOGY),
+                        sap_skill=sap_skill,
+                        domain_skills=domain_skills,
+                        clarification_answers=get(KEY_ANSWERS) or {},
+                        metadata=get(KEY_METADATA),
+                        section_structure=tsd_section_structure,
+                        locked_sections=locked_sections,
+                        target_section=target_section,
+                        instructions=instructions,
+                        previous_draft=previous_draft,
+                        feedback_text=feedback_text,
+                        fsd_full_text=get(KEY_FSD_FULL_TEXT),
+                    )
+
+                _render_interactive_loop({
+                    "doc_type": "TSD",
+                    "section_structure": tsd_section_structure,
+                    "locked_key": KEY_TSD_LOCKED_SECTIONS,
+                    "index_key": KEY_TSD_CURRENT_SECTION_INDEX,
+                    "draft_key": KEY_TSD_CURRENT_DRAFT,
+                    "revision_key": KEY_TSD_REVISION_COUNT,
+                    "draft_prev_key": KEY_TSD_DRAFT_PREV,
+                    "draft_feedback_key": KEY_TSD_DRAFT_FEEDBACK,
+                    "section_instructions": tsd_gen.TSD_SECTION_INSTRUCTIONS,
+                    "generate_draft": _tsd_generate_draft,
+                    "regenerate_draft": _tsd_regenerate_draft,
+                    "content_key": KEY_TSD_SECTION_CONTENT,
+                    "bytes_key": KEY_TSD_BYTES,
+                    "build_document": lambda content_dict: tsd_gen.build_tsd_bytes(content_dict, tsd_section_structure, get(KEY_TECHNOLOGY), get(KEY_METADATA)),
+                    "generated_at_key": KEY_TSD_GENERATED_AT,
+                    "next_step": STEP_TSD_DOWNLOAD,
+                })
             else:
-                tsd_bytes = tsd_gen.build_tsd_bytes(get(KEY_TSD_SECTION_CONTENT), tsd_section_structure, get(KEY_TECHNOLOGY), get(KEY_METADATA))
-                set_value(KEY_TSD_BYTES, tsd_bytes)
-                set_value(KEY_TSD_GENERATED_AT, datetime.now())
-                advance_to(STEP_TSD_DOWNLOAD)
-                st.rerun()
+                tsd_batches = tsd_gen.split_into_batches(tsd_section_structure)
+                completed, failed_index = _render_batch_progress(tsd_section_structure, tsd_batches, KEY_TSD_BATCH_STATUS)
+                st.progress(completed / len(tsd_batches) if tsd_batches else 1.0)
+
+                if not (failed_index is None and completed >= len(tsd_batches)):
+                    _render_section_tiles(tsd_section_structure, tsd_batches, get(KEY_TSD_BATCH_STATUS) or ["pending"] * len(tsd_batches))
+
+                def _generate_one_tsd_batch(batch):
+                    return tsd_gen.generate_tsd_batch(
+                        fsd_full_text=get(KEY_FSD_FULL_TEXT),
+                        technology=get(KEY_TECHNOLOGY),
+                        sap_skill=sap_skill,
+                        domain_skills=domain_skills,
+                        structured_summary=get(KEY_STRUCTURED_SUMMARY),
+                        clarification_answers=get(KEY_ANSWERS) or {},
+                        metadata=get(KEY_METADATA),
+                        section_structure=tsd_section_structure,
+                        batch_sections=batch,
+                    )
+
+                if failed_index is not None:
+                    batch = tsd_batches[failed_index]
+                    st.error(f"Batch {failed_index + 1} (Sections {batch[0]['number']}–{batch[-1]['number']}) failed to generate.")
+                    if st.button("🔁 Retry Failed Batch", type="primary", key="retry_tsd_batch_btn"):
+                        _reset_failed_batch(KEY_TSD_BATCH_STATUS, failed_index)
+                        _run_batches("TSD", tsd_batches, tsd_section_structure, KEY_TSD_SECTION_CONTENT, KEY_TSD_BATCH_STATUS, _generate_one_tsd_batch)
+                        st.rerun()
+                elif completed < len(tsd_batches):
+                    if st.button("⚡ Generate TSD", type="primary", key="run_tsd_batches_btn"):
+                        _run_batches("TSD", tsd_batches, tsd_section_structure, KEY_TSD_SECTION_CONTENT, KEY_TSD_BATCH_STATUS, _generate_one_tsd_batch)
+                        st.rerun()
+                else:
+                    tsd_bytes = tsd_gen.build_tsd_bytes(get(KEY_TSD_SECTION_CONTENT), tsd_section_structure, get(KEY_TECHNOLOGY), get(KEY_METADATA))
+                    set_value(KEY_TSD_BYTES, tsd_bytes)
+                    set_value(KEY_TSD_GENERATED_AT, datetime.now())
+                    advance_to(STEP_TSD_DOWNLOAD)
+                    st.rerun()
 
     # ---------------------------------------------------------------------------
     # Step 10 — TSD Download, Section Regeneration, Start Over
