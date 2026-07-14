@@ -1,15 +1,28 @@
 """Tests for core/interactive_generator.py — the interactive per-section loop
-(CLAUDE.md §3.7/§3.8a, FSD FR-09/FR-10/FR-15)."""
+(CLAUDE.md §3.7/§3.8a, FSD FR-09/FR-10/FR-15).
 
+Sequence under test: (a) pre-generation questions are generated in their own call,
+strictly before any content exists, and never resurface during the post-draft review
+loop; (b)/(c) content generation streams chunks using this section's own pre-generation
+answers; (e) locking stores pre_generation_questions, pre_generation_answers, and
+correction_history as separate fields, all carried forward as context to later
+sections; the Skip Review fast-mode hand-off renders already-locked content as plain
+text for the legacy batch generator.
+"""
+
+import json
 from unittest.mock import MagicMock, patch
 
+from core.fsd_generator import generate_fsd_batch, split_into_batches
 from core.interactive_generator import (
     append_open_questions_addendum,
-    apply_feedback_and_regenerate,
-    generate_section_draft,
+    build_locked_context_text,
+    generate_section_questions,
     get_max_regeneration_attempts,
     lock_section,
     should_force_lock,
+    stream_feedback_regeneration,
+    stream_section_draft,
 )
 from templates.fsd_default_structure import FSD_DEFAULT_SECTIONS
 
@@ -35,6 +48,7 @@ SAMPLE_DOMAIN_SKILLS = [
 ]
 
 SAMPLE_METADATA = {"consultant": "Jane Doe", "client": "Acme Corp", "project": "EPM Rollout", "engagement_code": "ENG-001"}
+SAMPLE_TECH_CONTEXT = {"technology": "SAP BW/4HANA", "sap_skill": SAMPLE_SAP_SKILL, "domain_skills": SAMPLE_DOMAIN_SKILLS}
 
 SECTION_1 = FSD_DEFAULT_SECTIONS[0]
 SECTION_2 = FSD_DEFAULT_SECTIONS[1]
@@ -48,152 +62,239 @@ def _mock_jinja_env(rendered: str = "rendered prompt"):
     return mock_env
 
 
-def _draft_response(content: str = "Section content.", question: str = "NONE") -> str:
-    return f"## SECTION_CONTENT:\n{content}\n## SECTION_QUESTION:\n{question}"
+def _template_names(mock_env) -> list:
+    return [call.args[0] for call in mock_env.get_template.call_args_list]
 
 
 # ---------------------------------------------------------------------------
-# One-section-per-call contract
+# (a) Pre-generation questions — generated before any content exists
 # ---------------------------------------------------------------------------
 
-class TestOneSectionPerCall:
+class TestGenerateSectionQuestions:
     @patch("core.interactive_generator.call_llm")
     @patch("core.interactive_generator.get_jinja_env")
-    def test_generate_section_draft_calls_llm_exactly_once(self, mock_env, mock_llm):
+    def test_calls_llm_exactly_once_and_returns_parsed_questions(self, mock_env, mock_llm):
         mock_env.return_value = _mock_jinja_env()
-        mock_llm.return_value = _draft_response("Draft for section 1.")
+        mock_llm.return_value = json.dumps(["Should currency translation use a fixed rate?", "Which legal entities are in scope?"])
 
-        draft = generate_section_draft(
+        questions = generate_section_questions(
+            section_spec=SECTION_1,
+            structured_summary=SAMPLE_STRUCTURED_SUMMARY,
+            technology_context=SAMPLE_TECH_CONTEXT,
+            locked_sections={},
+        )
+
+        mock_llm.assert_called_once()
+        assert questions == ["Should currency translation use a fixed rate?", "Which legal entities are in scope?"]
+
+    @patch("core.interactive_generator.call_llm")
+    @patch("core.interactive_generator.get_jinja_env")
+    def test_uses_the_pregeneration_template_not_the_content_template(self, mock_env, mock_llm):
+        mock_env.return_value = _mock_jinja_env()
+        mock_llm.return_value = "[]"
+
+        generate_section_questions(SECTION_1, SAMPLE_STRUCTURED_SUMMARY, SAMPLE_TECH_CONTEXT, {})
+
+        names = _template_names(mock_env.return_value)
+        assert "section_questions_pregeneration.j2" in names
+        assert "section_generation_interactive.j2" not in names
+
+    @patch("core.interactive_generator.call_llm")
+    @patch("core.interactive_generator.get_jinja_env")
+    def test_zero_questions_is_a_valid_result(self, mock_env, mock_llm):
+        mock_env.return_value = _mock_jinja_env()
+        mock_llm.return_value = "[]"
+
+        questions = generate_section_questions(SECTION_1, SAMPLE_STRUCTURED_SUMMARY, SAMPLE_TECH_CONTEXT, {})
+
+        assert questions == []
+
+    @patch("core.interactive_generator.call_llm")
+    @patch("core.interactive_generator.get_jinja_env")
+    def test_caps_at_six_questions(self, mock_env, mock_llm):
+        mock_env.return_value = _mock_jinja_env()
+        mock_llm.return_value = json.dumps([f"Question {i}?" for i in range(10)])
+
+        questions = generate_section_questions(SECTION_1, SAMPLE_STRUCTURED_SUMMARY, SAMPLE_TECH_CONTEXT, {})
+
+        assert len(questions) == 6
+
+    @patch("core.interactive_generator.call_llm")
+    @patch("core.interactive_generator.get_jinja_env")
+    def test_malformed_json_degrades_to_empty_list_never_raises(self, mock_env, mock_llm):
+        mock_env.return_value = _mock_jinja_env()
+        mock_llm.return_value = "not json"
+
+        questions = generate_section_questions(SECTION_1, SAMPLE_STRUCTURED_SUMMARY, SAMPLE_TECH_CONTEXT, {})
+
+        assert questions == []
+
+    @patch("core.interactive_generator.call_llm", side_effect=RuntimeError("boom"))
+    @patch("core.interactive_generator.get_jinja_env")
+    def test_llm_failure_degrades_to_empty_list_never_raises(self, mock_env, mock_llm):
+        mock_env.return_value = _mock_jinja_env()
+
+        questions = generate_section_questions(SECTION_1, SAMPLE_STRUCTURED_SUMMARY, SAMPLE_TECH_CONTEXT, {})
+
+        assert questions == []
+
+
+# ---------------------------------------------------------------------------
+# (c)/(d) Streamed content generation — never surfaces a question
+# ---------------------------------------------------------------------------
+
+class TestStreamSectionDraft:
+    @patch("core.interactive_generator.stream_llm")
+    @patch("core.interactive_generator.get_jinja_env")
+    def test_yields_chunks_from_stream_llm(self, mock_env, mock_stream_llm):
+        mock_env.return_value = _mock_jinja_env()
+        mock_stream_llm.return_value = iter(["Section content ", "streamed in pieces."])
+
+        chunks = list(stream_section_draft(
             doc_type="FSD",
             structured_summary=SAMPLE_STRUCTURED_SUMMARY,
             technology="SAP BW/4HANA",
             sap_skill=SAMPLE_SAP_SKILL,
             domain_skills=SAMPLE_DOMAIN_SKILLS,
-            clarification_answers={},
+            pre_generation_answers={},
             metadata=SAMPLE_METADATA,
             section_structure=FSD_DEFAULT_SECTIONS,
             locked_sections={},
             target_section=SECTION_1,
             instructions="Write section 1.",
-        )
+        ))
 
-        mock_llm.assert_called_once()
-        assert draft == {"content": "Draft for section 1.", "question": None}
+        assert chunks == ["Section content ", "streamed in pieces."]
+        mock_stream_llm.assert_called_once()
 
-    @patch("core.interactive_generator.call_llm")
+    @patch("core.interactive_generator.stream_llm")
     @patch("core.interactive_generator.get_jinja_env")
-    def test_apply_feedback_and_regenerate_calls_llm_exactly_once(self, mock_env, mock_llm):
+    def test_uses_the_content_template_not_the_question_template(self, mock_env, mock_stream_llm):
         mock_env.return_value = _mock_jinja_env()
-        mock_llm.return_value = _draft_response("Revised draft.", "Should X use Y or Z?")
+        mock_stream_llm.return_value = iter(["content"])
 
-        draft = apply_feedback_and_regenerate(
-            doc_type="FSD",
-            structured_summary=SAMPLE_STRUCTURED_SUMMARY,
-            technology="SAP BW/4HANA",
-            sap_skill=SAMPLE_SAP_SKILL,
-            domain_skills=SAMPLE_DOMAIN_SKILLS,
-            clarification_answers={},
-            metadata=SAMPLE_METADATA,
-            section_structure=FSD_DEFAULT_SECTIONS,
-            locked_sections={},
-            target_section=SECTION_1,
-            instructions="Write section 1.",
-            previous_draft={"content": "Original draft.", "question": None},
-            feedback_text="Use Y instead.",
-        )
+        list(stream_section_draft(
+            doc_type="FSD", structured_summary=SAMPLE_STRUCTURED_SUMMARY, technology="SAP BW/4HANA",
+            sap_skill=SAMPLE_SAP_SKILL, domain_skills=SAMPLE_DOMAIN_SKILLS, pre_generation_answers={},
+            metadata=SAMPLE_METADATA, section_structure=FSD_DEFAULT_SECTIONS, locked_sections={},
+            target_section=SECTION_1, instructions="Write section 1.",
+        ))
 
-        mock_llm.assert_called_once()
-        assert draft == {"content": "Revised draft.", "question": "Should X use Y or Z?"}
+        names = _template_names(mock_env.return_value)
+        assert "section_generation_interactive.j2" in names
+        assert "section_questions_pregeneration.j2" not in names
 
-    @patch("core.interactive_generator.call_llm")
+    @patch("core.interactive_generator.stream_llm")
     @patch("core.interactive_generator.get_jinja_env")
-    def test_prompt_only_mentions_the_single_target_section(self, mock_env, mock_llm):
-        """The section's own template render call must be given exactly one target_section."""
+    def test_passes_this_sections_pre_generation_answers_to_the_prompt(self, mock_env, mock_stream_llm):
         mock_jinja_env = _mock_jinja_env()
         mock_env.return_value = mock_jinja_env
-        mock_llm.return_value = _draft_response()
+        mock_stream_llm.return_value = iter(["content"])
+        answers = {"Fixed rate or real-time feed?": "Fixed monthly rate."}
 
-        generate_section_draft(
-            doc_type="FSD",
-            structured_summary=SAMPLE_STRUCTURED_SUMMARY,
-            technology="SAP BW/4HANA",
-            sap_skill=SAMPLE_SAP_SKILL,
-            domain_skills=SAMPLE_DOMAIN_SKILLS,
-            clarification_answers={},
-            metadata=SAMPLE_METADATA,
-            section_structure=FSD_DEFAULT_SECTIONS,
-            locked_sections={},
-            target_section=SECTION_2,
-            instructions="Write section 2.",
-        )
+        list(stream_section_draft(
+            doc_type="FSD", structured_summary=SAMPLE_STRUCTURED_SUMMARY, technology="SAP BW/4HANA",
+            sap_skill=SAMPLE_SAP_SKILL, domain_skills=SAMPLE_DOMAIN_SKILLS, pre_generation_answers=answers,
+            metadata=SAMPLE_METADATA, section_structure=FSD_DEFAULT_SECTIONS, locked_sections={},
+            target_section=SECTION_1, instructions="Write section 1.",
+        ))
 
         render_kwargs = mock_jinja_env.get_template.return_value.render.call_args.kwargs
-        assert render_kwargs["target_section"] == SECTION_2
-        assert isinstance(render_kwargs["target_section"], dict)
+        assert render_kwargs["pre_generation_answers"] == answers
+        assert render_kwargs["target_section"] == SECTION_1
+
+
+class TestStreamFeedbackRegeneration:
+    @patch("core.interactive_generator.stream_llm")
+    @patch("core.interactive_generator.get_jinja_env")
+    def test_yields_chunks_and_includes_feedback_in_the_prompt(self, mock_env, mock_stream_llm):
+        mock_jinja_env = _mock_jinja_env()
+        mock_env.return_value = mock_jinja_env
+        mock_stream_llm.return_value = iter(["Revised ", "draft."])
+
+        chunks = list(stream_feedback_regeneration(
+            doc_type="FSD", structured_summary=SAMPLE_STRUCTURED_SUMMARY, technology="SAP BW/4HANA",
+            sap_skill=SAMPLE_SAP_SKILL, domain_skills=SAMPLE_DOMAIN_SKILLS, pre_generation_answers={},
+            metadata=SAMPLE_METADATA, section_structure=FSD_DEFAULT_SECTIONS, locked_sections={},
+            target_section=SECTION_1, instructions="Write section 1.",
+            previous_content="Original draft.", feedback_text="Use Y instead.",
+        ))
+
+        assert "".join(chunks) == "Revised draft."
+        render_kwargs = mock_jinja_env.get_template.return_value.render.call_args.kwargs
+        assert render_kwargs["feedback"] == {"previous_content": "Original draft.", "feedback_text": "Use Y instead."}
 
 
 # ---------------------------------------------------------------------------
-# locked_sections accumulation
+# locked_sections schema — pre_generation_answers and correction_history are
+# separate fields, both carried forward as context to later sections
 # ---------------------------------------------------------------------------
 
-class TestLockedSectionsAccumulation:
-    def test_locking_multiple_sections_accumulates_without_losing_earlier_ones(self):
-        locked = {}
-        locked = lock_section(locked, "1", {"content": "Section 1 body.", "question": None}, "", 0)
-        locked = lock_section(locked, "2", {"content": "Section 2 body.", "question": "Q?"}, "my answer", 1)
+class TestLockSectionSchema:
+    def test_stores_pre_generation_and_correction_fields_separately(self):
+        locked = lock_section(
+            {}, "1", {"content": "Section 1 body."},
+            pre_generation_questions=["Q1?", "Q2?"],
+            pre_generation_answers={"Q1?": "A1", "Q2?": ""},
+            correction_history=["Make it shorter."],
+            revision_count=1,
+        )
 
-        assert set(locked.keys()) == {"1", "2"}
-        assert locked["1"]["content"] == "Section 1 body."
-        assert locked["1"]["revision_count"] == 0
-        assert locked["2"]["content"] == "Section 2 body."
-        assert locked["2"]["question"] == "Q?"
-        assert locked["2"]["answer"] == "my answer"
-        assert locked["2"]["revision_count"] == 1
+        entry = locked["1"]
+        assert entry["content"] == "Section 1 body."
+        assert entry["pre_generation_questions"] == ["Q1?", "Q2?"]
+        assert entry["pre_generation_answers"] == {"Q1?": "A1", "Q2?": ""}
+        assert entry["correction_history"] == ["Make it shorter."]
+        assert entry["revision_count"] == 1
+        assert entry["force_locked"] is False
 
-    def test_lock_section_does_not_mutate_the_input_dict(self):
-        original = {"1": {"content": "old", "question": None, "answer": "", "revision_count": 0, "force_locked": False}}
-        updated = lock_section(original, "2", {"content": "new", "question": None}, "", 0)
+    def test_does_not_mutate_the_input_dict(self):
+        original = {"1": {"content": "old"}}
+        updated = lock_section(original, "2", {"content": "new"}, [], {}, [], 0)
 
         assert "2" not in original
         assert "2" in updated
 
+    def test_locking_multiple_sections_accumulates_without_losing_earlier_ones(self):
+        locked = lock_section({}, "1", {"content": "Section 1 body."}, [], {}, [], 0)
+        locked = lock_section(locked, "2", {"content": "Section 2 body."}, ["Q?"], {"Q?": "A"}, ["fix this"], 1)
 
-# ---------------------------------------------------------------------------
-# Context carry-forward: later sections' prompts contain earlier locked content
-# ---------------------------------------------------------------------------
+        assert set(locked.keys()) == {"1", "2"}
+        assert locked["2"]["pre_generation_answers"] == {"Q?": "A"}
+        assert locked["2"]["correction_history"] == ["fix this"]
+
 
 class TestContextCarryForward:
-    @patch("core.interactive_generator.call_llm")
+    @patch("core.interactive_generator.stream_llm")
     @patch("core.interactive_generator.get_jinja_env")
-    def test_second_section_prompt_includes_first_locked_section(self, mock_env, mock_llm):
+    def test_second_section_prompt_includes_first_locked_sections_pregen_and_correction_fields(self, mock_env, mock_stream_llm):
         mock_jinja_env = _mock_jinja_env()
         mock_env.return_value = mock_jinja_env
-        mock_llm.return_value = _draft_response()
+        mock_stream_llm.return_value = iter(["content"])
 
         locked_sections = lock_section(
-            {}, "1", {"content": "Executive summary body.", "question": None}, "looks good", 0,
+            {}, "1", {"content": "Executive summary body."},
+            pre_generation_questions=["What is the reporting horizon?"],
+            pre_generation_answers={"What is the reporting horizon?": "3 years."},
+            correction_history=["Tighten the second paragraph."],
+            revision_count=1,
         )
 
-        generate_section_draft(
-            doc_type="FSD",
-            structured_summary=SAMPLE_STRUCTURED_SUMMARY,
-            technology="SAP BW/4HANA",
-            sap_skill=SAMPLE_SAP_SKILL,
-            domain_skills=SAMPLE_DOMAIN_SKILLS,
-            clarification_answers={},
-            metadata=SAMPLE_METADATA,
-            section_structure=FSD_DEFAULT_SECTIONS,
-            locked_sections=locked_sections,
-            target_section=SECTION_2,
-            instructions="Write section 2.",
-        )
+        list(stream_section_draft(
+            doc_type="FSD", structured_summary=SAMPLE_STRUCTURED_SUMMARY, technology="SAP BW/4HANA",
+            sap_skill=SAMPLE_SAP_SKILL, domain_skills=SAMPLE_DOMAIN_SKILLS, pre_generation_answers={},
+            metadata=SAMPLE_METADATA, section_structure=FSD_DEFAULT_SECTIONS, locked_sections=locked_sections,
+            target_section=SECTION_2, instructions="Write section 2.",
+        ))
 
         render_kwargs = mock_jinja_env.get_template.return_value.render.call_args.kwargs
         rendered_locked = render_kwargs["locked_sections"]
         assert len(rendered_locked) == 1
         assert rendered_locked[0]["number"] == "1"
         assert rendered_locked[0]["content"] == "Executive summary body."
-        assert rendered_locked[0]["answer"] == "looks good"
+        assert rendered_locked[0]["pre_generation_questions"] == ["What is the reporting horizon?"]
+        assert rendered_locked[0]["pre_generation_answers"] == {"What is the reporting horizon?": "3 years."}
+        assert rendered_locked[0]["correction_history"] == ["Tighten the second paragraph."]
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +321,7 @@ class TestForceLockBehaviour:
         assert should_force_lock(6) is True
 
     def test_force_locked_section_is_flagged_in_locked_sections(self):
-        locked = lock_section({}, "4", {"content": "Best-effort draft.", "question": None}, "still not right", 5, force_locked=True)
+        locked = lock_section({}, "4", {"content": "Best-effort draft."}, [], {}, ["still not right"], 5, force_locked=True)
         assert locked["4"]["force_locked"] is True
         assert locked["4"]["revision_count"] == 5
 
@@ -231,13 +332,13 @@ class TestForceLockBehaviour:
 
 class TestOpenQuestionsAddendum:
     def test_no_addendum_when_nothing_force_locked(self):
-        locked = lock_section({}, "1", {"content": "Body.", "question": None}, "", 0)
+        locked = lock_section({}, "1", {"content": "Body."}, [], {}, [], 0)
         result = append_open_questions_addendum(locked, FSD_DEFAULT_SECTIONS)
         assert result == locked
 
     def test_addendum_appended_to_open_questions_register_section(self):
-        locked = lock_section({}, "4", {"content": "Domain context.", "question": None}, "x", 5, force_locked=True)
-        locked = lock_section(locked, "12", {"content": "Open questions body.", "question": None}, "", 0)
+        locked = lock_section({}, "4", {"content": "Domain context."}, [], {}, ["x"], 5, force_locked=True)
+        locked = lock_section(locked, "12", {"content": "Open questions body."}, [], {}, [], 0)
 
         result = append_open_questions_addendum(locked, FSD_DEFAULT_SECTIONS)
 
@@ -248,8 +349,75 @@ class TestOpenQuestionsAddendum:
 
     def test_no_target_section_returns_unchanged_dict(self):
         sections_without_register = [s for s in FSD_DEFAULT_SECTIONS if "open question" not in s["title"].lower() and "assumption" not in s["title"].lower()]
-        locked = lock_section({}, "4", {"content": "Domain context.", "question": None}, "x", 5, force_locked=True)
+        locked = lock_section({}, "4", {"content": "Domain context."}, [], {}, ["x"], 5, force_locked=True)
 
         result = append_open_questions_addendum(locked, sections_without_register)
 
         assert result == locked
+
+
+# ---------------------------------------------------------------------------
+# Skip Review fast-mode hand-off — context text for the legacy batch generator
+# ---------------------------------------------------------------------------
+
+class TestBuildLockedContextText:
+    def test_empty_locked_sections_returns_empty_string(self):
+        assert build_locked_context_text({}, FSD_DEFAULT_SECTIONS) == ""
+
+    def test_renders_locked_section_number_title_and_content(self):
+        locked = lock_section({}, "1", {"content": "Document Control body."}, [], {}, [], 0)
+
+        text = build_locked_context_text(locked, FSD_DEFAULT_SECTIONS)
+
+        assert "Section 1" in text
+        assert "Document Control" in text
+        assert "Document Control body." in text
+
+    def test_orders_sections_numerically(self):
+        locked = lock_section({}, "10", {"content": "Ten body."}, [], {}, [], 0)
+        locked = lock_section(locked, "2", {"content": "Two body."}, [], {}, [], 0)
+
+        text = build_locked_context_text(locked, FSD_DEFAULT_SECTIONS)
+
+        assert text.index("Two body.") < text.index("Ten body.")
+
+
+class TestFastModeHandoffEndToEnd:
+    """Simulates the Skip Review button's core-layer effect: already-locked sections'
+    content is preserved as context, and the remaining sections are generated purely
+    through the legacy batch generator — no pre-generation question call is made."""
+
+    @patch("core.fsd_generator.call_llm")
+    @patch("core.fsd_generator.get_jinja_env")
+    def test_locked_content_reaches_the_batch_prompt_with_no_question_call(self, mock_env, mock_llm):
+        mock_template = MagicMock()
+        mock_template.render.return_value = "rendered"
+        mock_env.return_value.get_template.return_value = mock_template
+        mock_llm.return_value = "## SECTION_2:\nContent."
+
+        # Section 1 was already approved via the interactive loop before the user
+        # clicked "Skip Review — Generate Full FSD Now".
+        locked_sections = lock_section(
+            {}, "1", {"content": "Document Control body — already approved."}, [], {}, [], 0,
+        )
+        locked_context = build_locked_context_text(locked_sections, FSD_DEFAULT_SECTIONS)
+        assert "Document Control body — already approved." in locked_context
+
+        remaining = [s for s in FSD_DEFAULT_SECTIONS if s["number"] != "1"]
+        batches = split_into_batches(remaining)
+        generate_fsd_batch(
+            structured_summary=SAMPLE_STRUCTURED_SUMMARY,
+            technology="SAP BW/4HANA",
+            sap_skill=SAMPLE_SAP_SKILL,
+            domain_skills=SAMPLE_DOMAIN_SKILLS,
+            clarification_answers={},
+            metadata=SAMPLE_METADATA,
+            section_structure=FSD_DEFAULT_SECTIONS,
+            batch_sections=batches[0],
+            locked_context=locked_context,
+        )
+
+        render_kwargs = mock_template.render.call_args.kwargs
+        assert "Document Control body — already approved." in render_kwargs["locked_context"]
+        # Exactly one LLM call for this batch — no separate pre-generation question call.
+        mock_llm.assert_called_once()

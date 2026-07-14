@@ -32,22 +32,41 @@ KEY_TSD_BYTES = "tsd_bytes"
 KEY_WORKFLOW_STEP = "workflow_step"
 
 # Interactive section-by-section generation loop (CLAUDE.md §3.7/§3.8a) — one entry
-# per doc type. locked_sections is keyed by section number: {content, question,
-# answer, revision_count, force_locked}. current_section_index points at the section
-# currently being drafted; draft/draft_prev/draft_feedback hold the in-flight draft
-# and the correction text used for the most recent regeneration.
+# per doc type. locked_sections is keyed by section number: {content,
+# pre_generation_questions, pre_generation_answers, correction_history,
+# revision_count, force_locked}. current_section_index points at the section
+# currently being drafted.
+#
+# Per-section phase state (reset on lock/advance):
+#   pending_questions: None until generate_section_questions() has run for this
+#     section (step a); [] or a non-empty list once fetched.
+#   pending_answers: None until the step-(b) question form has been submitted
+#     (or skipped) for this section; {} or a filled dict once resolved. The
+#     None/dict distinction is what drives the phase transition from "asking
+#     questions" to "generating content".
+#   draft: the in-flight/streamed content draft, or None before the first chunk.
+#   draft_prev / draft_feedback: the previous content + correction text used for
+#     the most recent regeneration (step d).
+#   correction_history: every correction text entered during step d for this
+#     section, in order — stored separately from pending_answers when locked.
 KEY_FSD_LOCKED_SECTIONS = "fsd_locked_sections"
 KEY_FSD_CURRENT_SECTION_INDEX = "fsd_current_section_index"
+KEY_FSD_PENDING_QUESTIONS = "fsd_pending_questions"
+KEY_FSD_PENDING_ANSWERS = "fsd_pending_answers"
 KEY_FSD_CURRENT_DRAFT = "fsd_current_draft"
 KEY_FSD_REVISION_COUNT = "fsd_revision_count"
 KEY_FSD_DRAFT_PREV = "fsd_draft_prev"
 KEY_FSD_DRAFT_FEEDBACK = "fsd_draft_feedback"
+KEY_FSD_CORRECTION_HISTORY = "fsd_correction_history"
 KEY_TSD_LOCKED_SECTIONS = "tsd_locked_sections"
 KEY_TSD_CURRENT_SECTION_INDEX = "tsd_current_section_index"
+KEY_TSD_PENDING_QUESTIONS = "tsd_pending_questions"
+KEY_TSD_PENDING_ANSWERS = "tsd_pending_answers"
 KEY_TSD_CURRENT_DRAFT = "tsd_current_draft"
 KEY_TSD_REVISION_COUNT = "tsd_revision_count"
 KEY_TSD_DRAFT_PREV = "tsd_draft_prev"
 KEY_TSD_DRAFT_FEEDBACK = "tsd_draft_feedback"
+KEY_TSD_CORRECTION_HISTORY = "tsd_correction_history"
 
 # Token usage / cost tracking (CHANGE 2 — token and cost footer)
 KEY_STEP_INPUT_TOKENS = "step_input_tokens"
@@ -90,16 +109,22 @@ _ALL_KEYS = [
     KEY_WORKFLOW_STEP,
     KEY_FSD_LOCKED_SECTIONS,
     KEY_FSD_CURRENT_SECTION_INDEX,
+    KEY_FSD_PENDING_QUESTIONS,
+    KEY_FSD_PENDING_ANSWERS,
     KEY_FSD_CURRENT_DRAFT,
     KEY_FSD_REVISION_COUNT,
     KEY_FSD_DRAFT_PREV,
     KEY_FSD_DRAFT_FEEDBACK,
+    KEY_FSD_CORRECTION_HISTORY,
     KEY_TSD_LOCKED_SECTIONS,
     KEY_TSD_CURRENT_SECTION_INDEX,
+    KEY_TSD_PENDING_QUESTIONS,
+    KEY_TSD_PENDING_ANSWERS,
     KEY_TSD_CURRENT_DRAFT,
     KEY_TSD_REVISION_COUNT,
     KEY_TSD_DRAFT_PREV,
     KEY_TSD_DRAFT_FEEDBACK,
+    KEY_TSD_CORRECTION_HISTORY,
     KEY_STEP_INPUT_TOKENS,
     KEY_STEP_OUTPUT_TOKENS,
     KEY_SESSION_INPUT_TOKENS,
@@ -108,17 +133,64 @@ _ALL_KEYS = [
     KEY_TSD_GENERATED_AT,
 ]
 
-# Step numbers used by KEY_WORKFLOW_STEP — follows the FSD Section 7 workflow table
+# Step numbers used by KEY_WORKFLOW_STEP — follows the FSD Section 7 workflow table.
+# These are internal control-flow constants (used for `current_step >= STEP_X` checks)
+# and must stay stable — they are NOT the numbers shown to the user. STEP_QUESTIONS
+# only applies in legacy batched mode (INTERACTIVE_GENERATION=false); when the
+# interactive per-section loop is active it is skipped entirely. Use
+# active_step_sequence()/display_step_number() below to get the contiguous,
+# gap-free numbers that should actually be rendered in the UI.
 STEP_UPLOAD = 1               # Upload BRD (mandatory)
 STEP_ADDITIONAL_INPUT = 2     # Supporting docs + discussion notes + project metadata (all optional)
 STEP_SELECT_TECHNOLOGY = 3    # SAP technology + optional FSD/TSD templates
 STEP_ANALYSE = 4              # Pre-summarisation + domain auto-detection
-STEP_QUESTIONS = 5            # Clarification questions (skippable)
-STEP_GENERATE_FSD = 6         # Batched FSD generation
+STEP_QUESTIONS = 5            # Clarification questions (legacy batched mode only)
+STEP_GENERATE_FSD = 6         # FSD generation (interactive loop or legacy batch)
 STEP_FSD_DOWNLOAD = 7         # FSD download + section regeneration + "proceed to TSD" gate
 STEP_TSD_INPUT = 8            # FSD input choice (session vs re-upload) + optional TSD template
-STEP_GENERATE_TSD = 9         # Batched TSD generation
+STEP_GENERATE_TSD = 9         # TSD generation (interactive loop or legacy batch)
 STEP_TSD_DOWNLOAD = 10        # TSD download + section regeneration + start over
+
+# Ordered list of every step constant, in display order. active_step_sequence()
+# filters this down to whichever steps actually appear for the current generation
+# mode, so that display_step_number() always returns contiguous numbers — fixes the
+# bug where STEP_QUESTIONS being hidden in interactive mode left the UI jumping
+# straight from "Step 4" to "Step 6".
+_WORKFLOW_STEP_ORDER: list = [
+    STEP_UPLOAD,
+    STEP_ADDITIONAL_INPUT,
+    STEP_SELECT_TECHNOLOGY,
+    STEP_ANALYSE,
+    STEP_QUESTIONS,
+    STEP_GENERATE_FSD,
+    STEP_FSD_DOWNLOAD,
+    STEP_TSD_INPUT,
+    STEP_GENERATE_TSD,
+    STEP_TSD_DOWNLOAD,
+]
+
+# Steps that only ever appear in legacy batched mode — excluded from the active
+# sequence when the interactive per-section loop is running.
+_LEGACY_ONLY_STEPS: set = {STEP_QUESTIONS}
+
+
+def active_step_sequence(interactive_generation: bool) -> list:
+    """Return the STEP_* constants actually shown to the user, in display order,
+    for the given generation mode."""
+    if interactive_generation:
+        return [s for s in _WORKFLOW_STEP_ORDER if s not in _LEGACY_ONLY_STEPS]
+    return list(_WORKFLOW_STEP_ORDER)
+
+
+def display_step_number(step_const: int, interactive_generation: bool) -> int:
+    """Map an internal STEP_* constant to its 1-based position in the active step
+    sequence, so displayed step numbers are always contiguous regardless of which
+    steps are skipped for the current generation mode."""
+    sequence = active_step_sequence(interactive_generation)
+    try:
+        return sequence.index(step_const) + 1
+    except ValueError:
+        return step_const
 
 DEFAULT_METADATA: dict = {
     "consultant": "SAP EPM Design Agent",

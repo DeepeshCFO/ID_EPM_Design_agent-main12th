@@ -11,6 +11,9 @@
     - batch_sections (list[dict]): the subset of sections to generate in this call —
       each item has: number, title, description, format
     - section_instructions (dict): {section_number: detailed writing instructions}
+    - locked_context (str): optional plain-text content of sections already locked via the
+      interactive loop before "Skip Review — Generate Full FSD Now" handed the remaining
+      sections to this batch generator. Empty string on a cold-start batch run.
   Output:     Structured text with ## SECTION_N: markers, one per section in batch_sections.
 #}
 You are generating {{ batch_sections|length }} section(s): {% for section in batch_sections %}{{ section.number }}. {{ section.title }}{% if not loop.last %}, {% endif %}{% endfor %}.
@@ -74,6 +77,14 @@ No clarification answers were provided. Proceed with reasonable assumptions and 
 {% for title in all_section_titles %}
 - {{ title }}
 {% endfor %}
+
+{% if locked_context %}
+## Already-Locked Sections (from the interactive review before Skip Review was used)
+
+Maintain continuity with this content — do not repeat it, do not contradict it.
+
+{{ locked_context }}
+{% endif %}
 
 ## Sections to Generate in This Call
 

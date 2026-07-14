@@ -148,15 +148,32 @@ sap_epm_design_agent/
 ### 3.7 Generation Architecture — Interactive Section Loop (default)
 - FSD and TSD are NEVER generated in a single LLM call
 - The default generation mode as of v2.1 generates **exactly one section per LLM call**
-- Each call receives: structured_summary + technology_context + **all previously locked
-  sections' content and Q&A** + the single target section's spec
-- A section is not "generated" in the sense of being final until the user explicitly
-  approves it (blank/confirm response) — until then, it is a draft subject to
-  regeneration with feedback folded in
-- `interactive_generator.py` owns this loop: `generate_section_draft()`,
-  `apply_feedback_and_regenerate()`, `lock_section()`
-- Locked section state (content + Q&A history + revision count) is stored in session
-  state, keyed by section number, and passed forward to every subsequent section's prompt
+  for content generation — pre-generation questions (below) are a separate call
+- Per-section sequence, in order, for every section N:
+  1. **Pre-generation question phase.** Before any content for section N exists,
+     `generate_section_questions()` returns up to 5–6 targeted questions specific to
+     section N, based on the structured summary and every previously locked section's
+     content and Q&A. Zero questions is a valid, expected outcome.
+  2. **Batch question form.** All returned questions are shown together in one form,
+     each with its own optional free-text field, plus a "Skip & Generate Section"
+     button. This is a genuine batch — never one question at a time — and it is the
+     only point at which new questions are introduced for section N.
+  3. **Streamed content generation.** The section N draft is generated from:
+     structured_summary + technology_context + locked_sections' content/Q&A + this
+     section's pre-generation answers + the section spec. The response is streamed
+     to the UI as it arrives (see `llm_client.stream_llm()`) — it contains content
+     only, never a question.
+  4. **Pure-correction review loop.** The draft is shown with a single field: "Does
+     this look right? Leave blank to approve, or describe a correction to
+     regenerate." This step never surfaces a new question. A correction regenerates
+     the same section using the same pre-generation answers from step 2 plus the
+     correction text, looping this step until approved or
+     `MAX_SECTION_REGENERATION_ATTEMPTS` is hit.
+  5. **Lock.** On approval, the section's final content, its pre-generation questions,
+     its pre-generation answers, and its correction history are stored (as separate
+     fields — see §3.8a) and the loop restarts at step 1 for section N+1.
+- `interactive_generator.py` owns this loop: `generate_section_questions()`,
+  `stream_section_draft()`, `stream_feedback_regeneration()`, `lock_section()`
 - Maximum regeneration attempts per section: `MAX_SECTION_REGENERATION_ATTEMPTS` in
   .env (default 5). If exceeded, the section is force-locked using the latest draft and
   flagged in the Open Questions Register
@@ -165,9 +182,17 @@ sap_epm_design_agent/
 - Final document is assembled from the locked-sections dict once every section is locked
 - The legacy adaptive batching approach (grouping multiple sections into one call via
   `SECTION_WEIGHT` / `_BATCH_QUOTA` in `fsd_generator.py`/`tsd_generator.py`) remains in
-  the codebase as an optional fallback "fast mode" only, gated behind
-  `INTERACTIVE_GENERATION=false` in .env — it must never run concurrently with the
-  interactive loop for the same document
+  the codebase as an optional fallback "fast mode" gated behind
+  `INTERACTIVE_GENERATION=false` in .env, AND as a **mid-loop escape hatch**: a "Skip
+  Review — Generate Full FSD/TSD Now" button, visible throughout the interactive loop,
+  keeps whatever sections are already locked and hands the remaining pending sections
+  to the existing legacy batch generator (`generate_fsd_batch()`/`generate_tsd_batch()`
+  called via the existing `split_into_batches()`/`SECTION_WEIGHT` orchestration — never
+  a new batching implementation), passing already-locked content as a `locked_context`
+  string for continuity and asking no pre-generation questions for the handed-off
+  sections. The interactive loop and the legacy batch loop still never run
+  concurrently for the same document — the escape hatch is a one-way handoff for the
+  remainder of that document's generation, not concurrent execution.
 
 ### 3.8 BRD Pre-Summarisation Contract
 - `core/brd_summariser.py` performs the pre-summarisation LLM call
@@ -179,19 +204,29 @@ sap_epm_design_agent/
 
 ### 3.8a Interactive Section Loop Contract
 - `core/interactive_generator.py` is the only module allowed to orchestrate the
-  generate → present → review → lock cycle
-- Each section generation call must include **one and only one** target section in the
+  question → present → generate → review → lock cycle
+- Each content generation call must include **one and only one** target section in the
   prompt — never multiple sections per call while this mode is active
 - A section carries a status of exactly one of: `pending`, `current`, `locked`
 - `locked_sections: dict` in session state stores, per section number: final content,
-  the targeted question asked (if any), the user's answer/correction text, and a
-  revision count
-- The targeted question is generated as part of the same call that drafts the section
-  content — never a separate call
+  `pre_generation_questions` (the list asked in step 1), `pre_generation_answers` (the
+  user's answers from step 2), `correction_history` (every correction text entered
+  during step 4, in order), and a revision count. `pre_generation_answers` and
+  `correction_history` are DISTINCT fields — never collapsed into one — because later
+  sections' prompts need to reason about "what was clarified up front" separately from
+  "what had to be corrected after a draft was wrong"
+- Pre-generation questions (§3.7 step 1) are generated in their own call, strictly
+  before any content for that section exists — never as part of the same call that
+  drafts the section content, and never during the post-draft review loop (step 4),
+  which must never surface a new question
+- Content generation and feedback regeneration calls (§3.7 steps 3–4) are streamed via
+  `llm_client.stream_llm()` and rendered incrementally into an `st.empty()` placeholder
+  in `app.py` — the pre-generation question phase (steps 1–2) is never streamed
 - `app.py` renders section status from `locked_sections` and the current section's live
   draft — it must not track duplicate state of its own
-- Maximum 1 targeted question per section per generation attempt — no multi-question
-  batches inside the interactive loop
+- Maximum 5–6 pre-generation questions per section, asked once per section before
+  generation — no per-question follow-up calls, and no questions at all once step 3
+  (content generation) has started for that section
 
 ### 3.9 Two-Phase Workflow Contract
 - Phase 1 (FSD) and Phase 2 (TSD) are separate, sequential workflow stages
@@ -351,12 +386,18 @@ store in section_content_dict
 - ❌ Generate all 14 sections in a single API call
 - ❌ Create a new Jinja2 `Environment` inside a `core/` module — use `utils/jinja_env.py`
 - ❌ Start TSD generation before FSD is complete and downloaded
-- ❌ Generate more than one section per LLM call while `INTERACTIVE_GENERATION=true`
+- ❌ Generate more than one section's CONTENT per LLM call while `INTERACTIVE_GENERATION=true`
+  (pre-generation questions are a separate, earlier call — see §3.7)
 - ❌ Advance to the next section before the current one is explicitly locked
-- ❌ Ask more than one open question per section — no multi-question batches inside the
-  interactive loop
-- ❌ Run `interactive_generator.py` and the legacy `split_into_batches` path for the
-  same document generation
+- ❌ Ask a new question during the post-draft review loop (§3.7 step 4) — all
+  clarification for a section happens in its pre-generation question phase (step 1–2),
+  never after content generation has started
+- ❌ Ask more than 5–6 pre-generation questions for a single section, or split them
+  across more than one call/form — they are always one batch per section
+- ❌ Run `interactive_generator.py`'s section-by-section loop and the legacy
+  `split_into_batches` path concurrently on the SAME document generation — the Skip
+  Review fast-mode button is the one sanctioned exception, and only as a one-way,
+  mid-loop handoff of the remaining sections (§3.7), never running both loops at once
 
 ---
 
@@ -370,10 +411,13 @@ store in section_content_dict
   with/without answers, section content dict assembly
 - `test_document_builder.py`: named styles registered, cover page present, TOC field
   present, table header shading, alternating row colours
-- `test_interactive_generator.py`: single-section call contract (never >1 section per
-  prompt), locked_sections state accumulation across sections, regeneration attempt
-  counter and 5-attempt force-lock behaviour, context carry-forward (later sections'
-  prompts contain earlier locked content)
+- `test_interactive_generator.py`: single-section call contract (never >1 section's
+  content per prompt), pre-generation questions generated before content and never
+  during the post-draft review loop, locked_sections state accumulation across
+  sections with `pre_generation_answers` and `correction_history` stored as separate
+  fields and both passed as context to later sections, regeneration attempt counter
+  and 5-attempt force-lock behaviour, fast-mode hand-off preserving already-locked
+  content and asking no questions for the remaining sections
 - Run all: `pytest tests/ -v`
 
 ---

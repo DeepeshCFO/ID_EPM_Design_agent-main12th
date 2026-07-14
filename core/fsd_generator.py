@@ -151,8 +151,15 @@ def generate_fsd_batch(
     metadata: dict,
     section_structure: list,
     batch_sections: list,
+    locked_context: str = "",
 ) -> str:
     """Generate the raw LLM response text for ONE batch of FSD sections.
+
+    `locked_context` is optional plain-text content of sections already locked via
+    the interactive loop before "Skip Review" handed the remaining sections off to
+    this legacy batch generator (CLAUDE.md §3.7 fast-mode escape hatch) — it keeps
+    the remaining sections continuous with what the user already approved. Empty
+    string when the batch generator is used from a cold start, as before.
 
     Never raises LLMError: if the whole-batch call fails after retries, it falls
     back to generating each section individually, and a section that still fails
@@ -166,7 +173,7 @@ def generate_fsd_batch(
     logger.info("FSD batch: sections=%s weight=%s max_tokens=%d", section_numbers, weight, max_tokens)
 
     user_prompt = _render_batch_prompt(
-        structured_summary, technology, clarification_answers, metadata, section_structure, batch_sections,
+        structured_summary, technology, clarification_answers, metadata, section_structure, batch_sections, locked_context,
     )
     try:
         return call_llm(prompt=user_prompt, system=system_prompt, max_tokens=max_tokens)
@@ -177,7 +184,7 @@ def generate_fsd_batch(
         )
         return _generate_fsd_sections_individually(
             structured_summary, technology, clarification_answers, metadata,
-            section_structure, batch_sections, system_prompt,
+            section_structure, batch_sections, system_prompt, locked_context,
         )
 
 
@@ -189,6 +196,7 @@ def _generate_fsd_sections_individually(
     section_structure: list,
     batch_sections: list,
     system_prompt: str,
+    locked_context: str = "",
 ) -> str:
     """Fallback for a failed batch: generate each section on its own, one call at a time.
 
@@ -198,7 +206,7 @@ def _generate_fsd_sections_individually(
     rendered_parts = []
     for section in batch_sections:
         user_prompt = _render_batch_prompt(
-            structured_summary, technology, clarification_answers, metadata, section_structure, [section],
+            structured_summary, technology, clarification_answers, metadata, section_structure, [section], locked_context,
         )
         try:
             content = call_llm(prompt=user_prompt, system=system_prompt, max_tokens=_FALLBACK_MAX_TOKENS)
@@ -241,6 +249,7 @@ def _render_batch_prompt(
     metadata: dict,
     section_structure: list,
     batch_sections: list,
+    locked_context: str = "",
 ) -> str:
     """Render the FSD batch generation prompt."""
     env = get_jinja_env()
@@ -253,4 +262,5 @@ def _render_batch_prompt(
         all_section_titles=[f"{s['number']}. {s['title']}" for s in section_structure],
         batch_sections=batch_sections,
         section_instructions=FSD_SECTION_INSTRUCTIONS,
+        locked_context=locked_context,
     )

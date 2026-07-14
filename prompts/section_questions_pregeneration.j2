@@ -1,0 +1,96 @@
+{#
+  Purpose:    Generate up to N targeted, PRE-GENERATION clarification questions for ONE
+              section of an FSD/TSD — called BEFORE any content for that section exists
+              (CLAUDE.md §3.7/§3.8a step (a); FSD FR-09). Distinct from the post-draft
+              review loop, which is pure content correction and must never surface new
+              questions.
+  Variables:
+    - section_spec (dict): number, title, description, format — the section about to be drafted
+    - structured_summary (dict): requirements, kpis, data_sources, domain, key_entities, open_gaps
+    - technology (str): selected SAP technology
+    - locked_sections (list[dict]): every previously locked section — number, content,
+      pre_generation_questions, pre_generation_answers, correction_history — in section order
+    - max_questions (int): upper bound on how many questions may be returned
+  Output:     JSON array of up to max_questions question strings. Empty array if nothing
+              about this section is genuinely open given the context already available.
+#}
+You are about to draft Section {{ section_spec.number }}: {{ section_spec.title }} of a {{ technology }}
+{{ "Functional" if doc_type == "FSD" else "Technical" }} Specification Document. Before writing any
+content, identify what — if anything — is still genuinely ambiguous for THIS section specifically.
+
+## Structured Requirements Summary
+
+**Requirements:**
+{% for req in structured_summary.requirements %}
+- {{ req }}
+{% endfor %}
+
+**KPIs / Metrics:**
+{% for kpi in structured_summary.kpis %}
+- {{ kpi }}
+{% endfor %}
+
+**Data Sources:**
+{% for src in structured_summary.data_sources %}
+- {{ src }}
+{% endfor %}
+
+**Key Entities:**
+{% for entity in structured_summary.key_entities %}
+- {{ entity }}
+{% endfor %}
+
+**Open Gaps:**
+{% if structured_summary.open_gaps %}
+{% for gap in structured_summary.open_gaps %}
+- {{ gap }}
+{% endfor %}
+{% else %}
+None identified.
+{% endif %}
+
+{% if locked_sections %}
+## Previously Locked Sections (context — do not re-ask anything already resolved here)
+
+{% for locked in locked_sections %}
+### Section {{ locked.number }} (locked)
+{{ locked.content }}
+{% if locked.pre_generation_questions %}
+Pre-generation Q&A:
+{% for q in locked.pre_generation_questions %}
+- Q: {{ q }} — A: {{ locked.pre_generation_answers.get(q, "") or "(left blank)" }}
+{% endfor %}
+{% endif %}
+{% if locked.correction_history %}
+Corrections applied during review: {{ locked.correction_history | join("; ") }}
+{% endif %}
+
+{% endfor %}
+{% else %}
+No sections have been locked yet — this is the first section of the document.
+{% endif %}
+
+## Section About to Be Drafted
+
+### Section {{ section_spec.number }}: {{ section_spec.title }}
+{{ section_spec.description }}
+
+## Your Task
+
+Generate up to {{ max_questions }} targeted, section-specific clarification questions whose
+answers would materially change how Section {{ section_spec.number }} is written. Rules:
+- Only ask about THIS section — never a generic, document-wide discovery question
+- Do not ask anything already answered by the structured requirements summary or by a
+  previously locked section's content or Q&A above
+- Each question must be answerable in a sentence or two by a consultant or client stakeholder
+- If the section is unambiguous given everything already known, return an empty array —
+  zero questions is a valid and expected outcome
+
+## Output Format
+
+Return ONLY a valid JSON array of question strings. No preamble, no explanation, no markdown
+code fences.
+
+["The exact question text, written as a consultant would ask a client", "..."]
+
+If no questions are needed, return an empty array: []

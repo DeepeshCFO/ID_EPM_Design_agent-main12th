@@ -138,6 +138,58 @@ class TestGenerateTsdBatch:
         assert tsd_call is not None
         assert tsd_call.kwargs["fsd_full_text"] == SAMPLE_FSD_FULL_TEXT
 
+    @patch("core.tsd_generator.call_llm")
+    @patch("core.tsd_generator.get_jinja_env")
+    def test_locked_context_defaults_to_empty_string(self, mock_env, mock_llm):
+        """Skip Review fast-mode hand-off (CLAUDE.md §3.7): a cold-start batch call
+        (no prior interactive-loop sections locked) must render an empty locked_context,
+        never None or a missing kwarg."""
+        mock_template = MagicMock()
+        mock_template.render.return_value = "rendered"
+        mock_env.return_value.get_template.return_value = mock_template
+        mock_llm.return_value = "## SECTION_1:\nContent."
+
+        batches = split_into_batches(TSD_DEFAULT_SECTIONS)
+        generate_tsd_batch(
+            fsd_full_text=SAMPLE_FSD_FULL_TEXT,
+            technology="SAP BW/4HANA",
+            sap_skill=SAMPLE_SAP_SKILL,
+            domain_skills=SAMPLE_DOMAIN_SKILLS,
+            structured_summary=SAMPLE_STRUCTURED_SUMMARY,
+            clarification_answers={},
+            metadata=SAMPLE_METADATA,
+            section_structure=TSD_DEFAULT_SECTIONS,
+            batch_sections=batches[0],
+        )
+
+        render_kwargs = mock_template.render.call_args.kwargs
+        assert render_kwargs["locked_context"] == ""
+
+    @patch("core.tsd_generator.call_llm")
+    @patch("core.tsd_generator.get_jinja_env")
+    def test_locked_context_passed_through_to_prompt_render(self, mock_env, mock_llm):
+        mock_template = MagicMock()
+        mock_template.render.return_value = "rendered"
+        mock_env.return_value.get_template.return_value = mock_template
+        mock_llm.return_value = "## SECTION_1:\nContent."
+
+        batches = split_into_batches(TSD_DEFAULT_SECTIONS)
+        generate_tsd_batch(
+            fsd_full_text=SAMPLE_FSD_FULL_TEXT,
+            technology="SAP BW/4HANA",
+            sap_skill=SAMPLE_SAP_SKILL,
+            domain_skills=SAMPLE_DOMAIN_SKILLS,
+            structured_summary=SAMPLE_STRUCTURED_SUMMARY,
+            clarification_answers={},
+            metadata=SAMPLE_METADATA,
+            section_structure=TSD_DEFAULT_SECTIONS,
+            batch_sections=batches[0],
+            locked_context="### Section 1: Document Control (locked)\nAlready approved content.",
+        )
+
+        render_kwargs = mock_template.render.call_args.kwargs
+        assert render_kwargs["locked_context"] == "### Section 1: Document Control (locked)\nAlready approved content."
+
 
 # ---------------------------------------------------------------------------
 # build_tsd_bytes
